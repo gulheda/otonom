@@ -102,11 +102,22 @@ VTOL_SYSID      = 1
 DRONE_IP        = "127.0.0.1"
 DRONE_MSG_PORT  = 6000
 PERSON_CLASS_ID = 0    # COCO veri setinde "person" sınıfı 0'dır
+GZ_WORLD_NAME   = "default"   # gz service çağrısında kullanılır
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GPS & GEOMETRİ YARDIMCILARI
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def gps_to_gz_xy(lat, lon, home_lat, home_lon):
+    """
+    GPS koordinatını Gazebo dünya koordinatına çevirir.
+    ArduPilot SITL ENU sistemini kullanır: X=Doğu, Y=Kuzey.
+    """
+    north = (lat - home_lat) * 111_320.0
+    east  = (lon - home_lon) * 111_320.0 * math.cos(math.radians(home_lat))
+    return east, north   # (gz_x, gz_y)
+
 
 def haversine(lat1, lon1, lat2, lon2):
     """İki GPS noktası arasındaki mesafeyi metre cinsinden döndürür."""
@@ -687,6 +698,12 @@ class VTOLController:
         for i, (la, lo, al) in enumerate(dynamic_waypoints):
             print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}")
 
+        # Gazebo'da her hedef noktasına kırmızı marker spawn et
+        print("[İHA] Gazebo marker'ları oluşturuluyor...")
+        for i, (la, lo, _) in enumerate(dynamic_waypoints):
+            gx, gy = gps_to_gz_xy(la, lo, home_lat, home_lon)
+            self._spawn_human_marker(f"human_{i+1}", gx, gy)
+
         # ── Mission yükleme ───────────────────────────────────────────────────
 
         self._clear_mission()
@@ -850,6 +867,59 @@ class VTOLController:
         # Drone'un koordinatı alması için bekle, sonra dön
         time.sleep(5)
         self._rtl()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  GAZEBO MARKER SPAWN
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _spawn_human_marker(self, name, gz_x, gz_y):
+        """
+        Gazebo'da belirtilen konuma kırmızı silindir ('insan') model spawn eder.
+        gz service CLI kullanılır; Gazebo çalışmıyorsa sessizce geçer.
+        """
+        import subprocess
+
+        sdf = (
+            '<sdf version="1.6">'
+            f'<model name="{name}"><static>true</static>'
+            '<link name="link">'
+            '<visual name="v">'
+            '<geometry><cylinder><radius>0.35</radius>'
+            '<length>1.8</length></cylinder></geometry>'
+            '<material>'
+            '<ambient>0.9 0.1 0.1 1</ambient>'
+            '<diffuse>0.9 0.1 0.1 1</diffuse>'
+            '</material>'
+            '</visual>'
+            '<collision name="c">'
+            '<geometry><cylinder><radius>0.35</radius>'
+            '<length>1.8</length></cylinder></geometry>'
+            '</collision>'
+            '</link></model></sdf>'
+        )
+        sdf_escaped = sdf.replace('"', '\\"')
+        req = (
+            f'sdf: "{sdf_escaped}", '
+            f'pose: {{position: {{x: {gz_x:.2f}, y: {gz_y:.2f}, z: 0.9}}}}'
+        )
+        try:
+            result = subprocess.run(
+                ["gz", "service",
+                 "-s", f"/world/{GZ_WORLD_NAME}/create",
+                 "--reqtype", "gz.msgs.EntityFactory",
+                 "--reptype", "gz.msgs.Boolean",
+                 "--timeout", "3000",
+                 "--req", req],
+                capture_output=True, text=True, timeout=6,
+            )
+            if "true" in result.stdout.lower():
+                print(f"[Gazebo] ✓ '{name}' spawn edildi "
+                      f"(x={gz_x:.1f}m doğu, y={gz_y:.1f}m kuzey)")
+            else:
+                print(f"[Gazebo] '{name}' spawn başarısız – "
+                      f"{result.stderr.strip()[:80]}")
+        except Exception as exc:
+            print(f"[Gazebo] Spawn hatası: {exc}")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  İNCELEME DAVRANIŞI
