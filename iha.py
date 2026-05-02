@@ -230,12 +230,18 @@ class VTOLController:
         print("[İHA] Mission yükleme timeout!")
         return False
 
-    def _set_current_item(self, seq):
-        self.vehicle.mav.mission_set_current_send(
-            self.vehicle.target_system, self.vehicle.target_component, seq)
-        msg = self.vehicle.recv_match(type="MISSION_CURRENT", blocking=True, timeout=5)
-        if msg:
-            print(f"[İHA] Mission başlangıç item: {msg.seq}")
+    def _set_current_item(self, seq, retries=5):
+        for _ in range(retries):
+            self.vehicle.mav.mission_set_current_send(
+                self.vehicle.target_system, self.vehicle.target_component, seq)
+            msg = self.vehicle.recv_match(
+                type="MISSION_CURRENT", blocking=True, timeout=3)
+            if msg and msg.seq == seq:
+                print(f"[İHA] Mission başlangıç item: {msg.seq}")
+                return True
+            time.sleep(0.5)
+        print(f"[İHA] Mission current {seq} onaylanamadı – devam ediliyor.")
+        return False
 
     # ── RTL ──────────────────────────────────────────────────────────────────
 
@@ -282,46 +288,51 @@ class VTOLController:
         self._set_current_item(1)
         self._set_mode("AUTO")
 
-        # Waypoint döngüsü
-        visited = []
-        for idx, (wp_lat, wp_lon, wp_alt) in enumerate(waypoints):
-            if not self.mission_active:
-                break
+        # Waypoint monitoring – MISSION_ITEM_REACHED ile sıralı bekle
+        # seq 1 = WP1, seq 2 = WP2, seq 3 = WP3
+        n = len(waypoints)
+        visited   = [None] * n
+        next_seq  = 1   # beklenen minimum seq
 
-            print(f"\n[İHA] ── WAYPOINT {idx+1}/3 ──")
-            print(f"[İHA] Hedef: lat={wp_lat:.7f}  lon={wp_lon:.7f}")
+        print(f"\n[İHA] Mission izleniyor ({n} waypoint)...")
 
-            mission_seq = idx + 1
-            while self.mission_active:
-                # MISSION_ITEM_REACHED önce kontrol et (araç hızlı geçebilir)
-                mreach = self.vehicle.recv_match(
-                    type="MISSION_ITEM_REACHED", blocking=False)
-                if mreach is not None and mreach.seq >= mission_seq:
-                    print(f"\n[İHA] Mission item {mreach.seq} tamamlandı.")
-                    break
+        deadline = time.time() + 600  # max 10 dakika
+        while next_seq <= n and self.mission_active and time.time() < deadline:
+            mreach = self.vehicle.recv_match(
+                type="MISSION_ITEM_REACHED", blocking=True, timeout=5)
+            if mreach is None:
+                # Timeout – mesafe ile de kontrol et
                 lat, lon, _, _ = self._get_position()
-                if lat is None:
-                    time.sleep(0.3)
+                if lat is not None:
+                    wp_lat, wp_lon, _ = waypoints[next_seq - 1]
+                    dist = haversine(lat, lon, wp_lat, wp_lon)
+                    print(f"[İHA] WP{next_seq} bekleniyor – mesafe: {dist:.1f} m",
+                          end="\r")
+                    if dist < WP_ARRIVAL_DIST:
+                        mreach_seq = next_seq
+                    else:
+                        continue
+                else:
                     continue
-                dist = haversine(lat, lon, wp_lat, wp_lon)
-                print(f"[İHA] Mesafe: {dist:.1f} m", end="\r")
-                if dist < WP_ARRIVAL_DIST:
-                    print()
-                    break
-                time.sleep(0.3)
+            else:
+                mreach_seq = mreach.seq
 
-            cur_lat, cur_lon, cur_alt, _ = self._get_position()
-            if cur_lat is None:
-                cur_lat, cur_lon, cur_alt = wp_lat, wp_lon, wp_alt
-
-            visited.append((cur_lat, cur_lon, cur_alt))
-            print("─" * 52)
-            print(f"  [İHA] WAYPOINT {idx+1} ULAŞILDI")
-            print(f"  latitude  : {cur_lat:.7f}")
-            print(f"  longitude : {cur_lon:.7f}")
-            print(f"  altitude  : {cur_alt:.1f} m")
-            print("─" * 52)
-            time.sleep(WP_HOVER_TIME)
+            # Beklenenden önceki seq'ler geçilmişse hepsini işle
+            while next_seq <= mreach_seq and next_seq <= n:
+                idx = next_seq - 1
+                wp_lat, wp_lon, wp_alt = waypoints[idx]
+                cur_lat, cur_lon, cur_alt, _ = self._get_position()
+                if cur_lat is None:
+                    cur_lat, cur_lon, cur_alt = wp_lat, wp_lon, wp_alt
+                visited[idx] = (cur_lat, cur_lon, cur_alt)
+                print(f"\n{'─' * 52}")
+                print(f"  [İHA] WAYPOINT {next_seq} ULAŞILDI")
+                print(f"  latitude  : {cur_lat:.7f}")
+                print(f"  longitude : {cur_lon:.7f}")
+                print(f"  altitude  : {cur_alt:.1f} m")
+                print(f"{'─' * 52}")
+                time.sleep(WP_HOVER_TIME)
+                next_seq += 1
 
         # Özet
         print("\n" + "═" * 52)
