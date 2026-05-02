@@ -62,10 +62,14 @@ MISSION_MODE = "WAYPOINT"
 
 # ── Waypoint ayarları ────────────────────────────────────────────────────────
 # Kalkış noktasından kaç metre uzakta waypoint üretilsin?
-WP_OFFSET_M     = 80.0   # metre  (kuzey / doğu / güney)
-WP_ALT          = 30.0   # metre  (waypoint irtifası)
-WP_ARRIVAL_DIST = 8.0    # metre  – bu mesafe içinde "ulaşıldı" sayılır
-WP_HOVER_TIME   = 3.0    # saniye – waypoint üzerinde bekleme
+WP_OFFSET_M     = 50.0   # metre  (kuzey / doğu / güney)
+WP_ALT          = 30.0   # metre  (seyir irtifası)
+WP_ARRIVAL_DIST = 10.0   # metre  – bu mesafe içinde "ulaşıldı" sayılır
+WP_HOVER_TIME   = 2.0    # saniye – inceleme öncesi bekleme
+
+# ── İnceleme davranışı ────────────────────────────────────────────────────────
+INSPECT_ALT     = 12.0   # metre  – inceleme irtifası (alçalma)
+INSPECT_TIME    = 5.0    # saniye – inceleme noktasında bekleme süresi
 
 # ── Kalkış ───────────────────────────────────────────────────────────────────
 TAKEOFF_ALT  = 30.0    # metre
@@ -740,19 +744,28 @@ class VTOLController:
                     self._goto(wp_lat, wp_lon, wp_alt)
                 time.sleep(0.3)
 
-            # Ulaşıldı
+            # Ulaşıldı – inceleme davranışı
             cur_lat, cur_lon, cur_alt, _ = self._get_position()
             if cur_lat is None:
                 cur_lat, cur_lon, cur_alt = wp_lat, wp_lon, wp_alt
 
-            visited.append((cur_lat, cur_lon, cur_alt))
             print("─" * 50)
-            print(f"  [İHA] WAYPOINT {idx+1} ULAŞILDI")
+            print(f"  [İHA] HEDEF {idx+1} ULAŞILDI")
             print(f"  latitude  : {cur_lat:.7f}")
             print(f"  longitude : {cur_lon:.7f}")
             print(f"  altitude  : {cur_alt:.1f} m")
             print("─" * 50)
             time.sleep(WP_HOVER_TIME)
+
+            # İnceleme: in → bekle → çık
+            self._inspect_point(wp_lat, wp_lon, idx + 1)
+            visited.append((wp_lat, wp_lon, INSPECT_ALT))
+
+            # Bir sonraki waypoint için AUTO moda dön
+            if idx + 1 < len(dynamic_waypoints):
+                print(f"[İHA] AUTO moda dönülüyor – sonraki hedef...")
+                self._set_current_mission_item(idx + 2)
+                self._set_mode("AUTO")
 
         # ── Özet ve RTL ───────────────────────────────────────────────────────
         print("\n" + "═" * 55)
@@ -837,6 +850,55 @@ class VTOLController:
         # Drone'un koordinatı alması için bekle, sonra dön
         time.sleep(5)
         self._rtl()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  İNCELEME DAVRANIŞI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _inspect_point(self, lat, lon, wp_idx):
+        """
+        Hedefe varıldıktan sonra:
+          1. GUIDED moda geç.
+          2. INSPECT_ALT irtifasına in (yaklaşık konum koru).
+          3. INSPECT_TIME saniye bekle (insan tespiti simülasyonu).
+          4. WP_ALT irtifasına geri çık.
+        """
+        print(f"\n[İHA] ▼ İNCELEME {wp_idx} – {INSPECT_ALT}m'ye iniliyor...")
+        self._set_mode("GUIDED")
+        time.sleep(0.3)
+
+        # Alçal
+        self._goto(lat, lon, INSPECT_ALT)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            _, _, alt, _ = self._get_position()
+            if alt is None:
+                time.sleep(0.3)
+                continue
+            print(f"[İHA] İrtifa: {alt:.1f} m → {INSPECT_ALT} m", end="\r")
+            if alt <= INSPECT_ALT + 2.0:
+                break
+            self._goto(lat, lon, INSPECT_ALT)
+            time.sleep(0.5)
+
+        print(f"\n[İHA] ● İnceleme noktasında – {INSPECT_TIME}s bekleniyor...")
+        time.sleep(INSPECT_TIME)
+
+        # Yüksel
+        print(f"[İHA] ▲ {WP_ALT}m seyir irtifasına çıkılıyor...")
+        self._goto(lat, lon, WP_ALT)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            _, _, alt, _ = self._get_position()
+            if alt is None:
+                time.sleep(0.3)
+                continue
+            print(f"[İHA] İrtifa: {alt:.1f} m → {WP_ALT} m", end="\r")
+            if alt >= WP_ALT - 3.0:
+                break
+            self._goto(lat, lon, WP_ALT)
+            time.sleep(0.5)
+        print(f"\n[İHA] Seyir irtifasına döndü.")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  MİSSION YÜKLEME YARDIMCILARI
