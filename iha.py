@@ -659,7 +659,7 @@ class VTOLController:
         AUTO mod başarısız olursa GUIDED + DO_REPOSITION fallback kullanılır.
         """
         self._set_speed(CRUISE_SPEED)
-        print(f"\n[İHA] WAYPOINT görevi başlıyor – {len(MISSION_WAYPOINTS)} nokta")
+        print(f"\n[İHA] WAYPOINT görevi başlıyor – 3 nokta (spawn'a göre dinamik)")
 
         # ── Mevcut konumdan dinamik waypoint üret ────────────────────────────
         home_lat, home_lon, home_alt, _ = self._get_position()
@@ -708,7 +708,7 @@ class VTOLController:
             if not self.mission_active:
                 break
 
-            print(f"\n[İHA] ── WAYPOINT {idx+1}/{len(MISSION_WAYPOINTS)} ──")
+            print(f"\n[İHA] ── WAYPOINT {idx+1}/{len(dynamic_waypoints)} ──")
             print(f"[İHA] Hedef: lat={wp_lat:.6f}  lon={wp_lon:.6f}  "
                   f"alt={wp_alt:.1f}m")
 
@@ -853,7 +853,7 @@ class VTOLController:
           item n : RTL
         """
         if wps is None:
-            wps = MISSION_WAYPOINTS
+            wps = []
         items = []
 
         # Item 0: Home
