@@ -60,16 +60,11 @@ except TypeError as exc:
 # "SCAN"     : oval tarama + YOLO (vision entegrasyonu tamamlandıktan sonra)
 MISSION_MODE = "WAYPOINT"
 
-# ── 3 Görev waypoint'i (lat, lon, irtifa_m) ──────────────────────────────────
-# İstediğin koordinatları buraya gir; VTOL sırayla ziyaret eder.
-MISSION_WAYPOINTS = [
-    (47.3990000, 8.5466000, 30.0),   # Waypoint 1 – ~85m kuzey
-    (47.3982419, 8.5474000, 30.0),   # Waypoint 2 – ~60m doğu
-    (47.3975000, 8.5466000, 30.0),   # Waypoint 3 – ~85m güney
-]
-
-# Waypoint'e ulaşma toleransı ve bekleme süresi
-WP_ARRIVAL_DIST = 8.0    # metre – bu mesafe içinde "ulaşıldı" sayılır
+# ── Waypoint ayarları ────────────────────────────────────────────────────────
+# Kalkış noktasından kaç metre uzakta waypoint üretilsin?
+WP_OFFSET_M     = 80.0   # metre  (kuzey / doğu / güney)
+WP_ALT          = 30.0   # metre  (waypoint irtifası)
+WP_ARRIVAL_DIST = 8.0    # metre  – bu mesafe içinde "ulaşıldı" sayılır
 WP_HOVER_TIME   = 3.0    # saniye – waypoint üzerinde bekleme
 
 # ── Kalkış ───────────────────────────────────────────────────────────────────
@@ -666,18 +661,36 @@ class VTOLController:
         self._set_speed(CRUISE_SPEED)
         print(f"\n[İHA] WAYPOINT görevi başlıyor – {len(MISSION_WAYPOINTS)} nokta")
 
-        # ── Mission yükleme ───────────────────────────────────────────────────
+        # ── Mevcut konumdan dinamik waypoint üret ────────────────────────────
         home_lat, home_lon, home_alt, _ = self._get_position()
         if home_lat is None:
-            home_lat, home_lon, home_alt = (
-                MISSION_WAYPOINTS[0][0], MISSION_WAYPOINTS[0][1], TAKEOFF_ALT)
+            print("[İHA] GPS alınamadı!")
+            return
+
+        print(f"[İHA] Ev konumu: lat={home_lat:.7f}  lon={home_lon:.7f}  "
+              f"alt={home_alt:.1f}m")
+
+        # Sabit MISSION_WAYPOINTS yerine ev etrafında küçük üçgen oluştur
+        d = WP_OFFSET_M
+        dlat = d / 111_320.0
+        dlon = d / (111_320.0 * math.cos(math.radians(home_lat)))
+        dynamic_waypoints = [
+            (home_lat + dlat, home_lon,        WP_ALT),  # Kuzey
+            (home_lat,        home_lon + dlon, WP_ALT),  # Doğu
+            (home_lat - dlat, home_lon,        WP_ALT),  # Güney
+        ]
+        print(f"[İHA] Dinamik waypoint'ler ({d}m offset, {WP_ALT}m irtifa):")
+        for i, (la, lo, al) in enumerate(dynamic_waypoints):
+            print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}")
+
+        # ── Mission yükleme ───────────────────────────────────────────────────
 
         self._clear_mission()
         time.sleep(0.5)
-        mission_ok = self._upload_waypoints_mission(home_lat, home_lon, home_alt)
+        mission_ok = self._upload_waypoints_mission(
+            home_lat, home_lon, home_alt, dynamic_waypoints)
 
         if mission_ok:
-            # Item 1 = ilk waypoint; AUTO mod buradan başlasın
             self._set_current_mission_item(1)
             auto_ok = self._set_mode("AUTO")
             if not auto_ok:
@@ -691,7 +704,7 @@ class VTOLController:
         # ── Waypoint döngüsü ──────────────────────────────────────────────────
         visited = []
 
-        for idx, (wp_lat, wp_lon, wp_alt) in enumerate(MISSION_WAYPOINTS):
+        for idx, (wp_lat, wp_lon, wp_alt) in enumerate(dynamic_waypoints):
             if not self.mission_active:
                 break
 
@@ -831,17 +844,16 @@ class VTOLController:
         if ack:
             print("[İHA] Eski mission temizlendi.")
 
-    def _upload_waypoints_mission(self, home_lat, home_lon, home_alt):
+    def _upload_waypoints_mission(self, home_lat, home_lon, home_alt, wps=None):
         """
         Araç zaten havada; mission yükler:
           item 0 : home (mevcut konum)
           item 1 : WP1  (current=1 → buradan başla)
-          item 2 : WP2
-          item 3 : WP3
-          item 4 : RTL
-        AUTO moduna geçince araç sırayla WP'leri ziyaret edip RTL yapar.
+          ...
+          item n : RTL
         """
-        wps = MISSION_WAYPOINTS
+        if wps is None:
+            wps = MISSION_WAYPOINTS
         items = []
 
         # Item 0: Home
@@ -945,9 +957,8 @@ class VTOLController:
         print(f"  Görev modu         : {MISSION_MODE}")
         print(f"  MAVLink            : {VTOL_CONNECTION}")
         if MISSION_MODE == "WAYPOINT":
-            for i, wp in enumerate(MISSION_WAYPOINTS):
-                print(f"  WP{i+1}               : "
-                      f"lat={wp[0]:.6f}  lon={wp[1]:.6f}  alt={wp[2]:.0f}m")
+            print(f"  WP offset          : {WP_OFFSET_M}m (eve göre kuzey/doğu/güney)")
+            print(f"  WP irtifa          : {WP_ALT}m")
         else:
             print(f"  Kamera topic       : {CAMERA_TOPIC}")
             print(f"  YOLO modeli        : {YOLO_MODEL}")
