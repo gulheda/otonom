@@ -63,9 +63,9 @@ MISSION_MODE = "WAYPOINT"
 # ── 3 Görev waypoint'i (lat, lon, irtifa_m) ──────────────────────────────────
 # İstediğin koordinatları buraya gir; VTOL sırayla ziyaret eder.
 MISSION_WAYPOINTS = [
-    (47.3990000, 8.5460000, 50.0),   # Waypoint 1
-    (47.3975000, 8.5480000, 50.0),   # Waypoint 2
-    (47.3965000, 8.5455000, 50.0),   # Waypoint 3
+    (47.3990000, 8.5466000, 30.0),   # Waypoint 1 – ~85m kuzey
+    (47.3982419, 8.5474000, 30.0),   # Waypoint 2 – ~60m doğu
+    (47.3975000, 8.5466000, 30.0),   # Waypoint 3 – ~85m güney
 ]
 
 # Waypoint'e ulaşma toleransı ve bekleme süresi
@@ -73,8 +73,8 @@ WP_ARRIVAL_DIST = 8.0    # metre – bu mesafe içinde "ulaşıldı" sayılır
 WP_HOVER_TIME   = 3.0    # saniye – waypoint üzerinde bekleme
 
 # ── Kalkış ───────────────────────────────────────────────────────────────────
-TAKEOFF_ALT  = 50.0    # metre
-CRUISE_SPEED = 10.0    # m/s
+TAKEOFF_ALT  = 30.0    # metre
+CRUISE_SPEED = 5.0     # m/s
 
 # ── Oval tarama (MISSION_MODE="SCAN" için) ───────────────────────────────────
 SCAN_CENTER     = (47.3982419, 8.5465938)
