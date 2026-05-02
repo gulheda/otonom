@@ -167,6 +167,7 @@ class GazeboCamera:
         self._lock         = threading.Lock()
         self._total_frames = 0
         self._node         = None
+        self._sub          = None   # subscription referansı – GC'den korur
         self._running      = False
 
     def start(self):
@@ -176,13 +177,27 @@ class GazeboCamera:
             return False
         try:
             self._node = GzNode()
-            self._node.subscribe(GzImage, self.topic, self._callback)
+            # Dönüş değeri saklanmazsa Python GC subscription'ı siler → frame gelmez
+            self._sub  = self._node.subscribe(GzImage, self.topic, self._callback)
             self._running = True
             print(f"[Kamera] Abone olundu: {self.topic}")
+            # Tanılama: 3 saniye içinde ilk frame gelip gelmediğini kontrol et
+            threading.Thread(target=self._check_first_frame, daemon=True).start()
             return True
         except Exception as exc:
             print(f"[Kamera] Başlatma hatası: {exc}")
             return False
+
+    def _check_first_frame(self, timeout=5):
+        """Başlangıçta frame gelip gelmediğini kontrol eder, gelmezse uyarır."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._total_frames > 0:
+                print(f"[Kamera] İlk frame alındı (toplam: {self._total_frames})")
+                return
+            time.sleep(0.5)
+        print(f"[Kamera] UYARI: {timeout}s içinde frame gelmedi. "
+              f"Gazebo çalışıyor mu? Topic: {self.topic}")
 
     def _callback(self, msg):
         """Gazebo'dan gelen protobuf Image mesajını OpenCV frame'e çevirir."""
@@ -486,12 +501,20 @@ class VTOLController:
         """
         print("[Görüntü] YOLOv8 işleme döngüsü başladı.")
         prev_frame_count = 0
+        no_frame_warn_ts = time.time()
 
         while self.mission_active and not self._target_found:
             # Kamera bağlı değil veya frame gelmiyorsa bekle
             if self.camera.frame_count == prev_frame_count:
+                # Her 10 saniyede bir "frame yok" uyarısı bas
+                if time.time() - no_frame_warn_ts >= 10:
+                    print(f"[Görüntü] Bekleniyor – frame sayısı: "
+                          f"{self.camera.frame_count}  "
+                          f"(kamera topic: {CAMERA_TOPIC})")
+                    no_frame_warn_ts = time.time()
                 time.sleep(0.05)
                 continue
+            no_frame_warn_ts = time.time()
 
             frame = self.camera.get_frame()
             prev_frame_count = self.camera.frame_count
