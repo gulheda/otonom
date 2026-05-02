@@ -102,7 +102,7 @@ VTOL_SYSID      = 1
 DRONE_IP        = "127.0.0.1"
 DRONE_MSG_PORT  = 6000
 PERSON_CLASS_ID = 0    # COCO veri setinde "person" sınıfı 0'dır
-GZ_WORLD_NAME   = "default"   # gz service çağrısında kullanılır
+GZ_WORLD_NAME   = ""   # boş bırakılırsa otomatik tespit edilir
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -698,11 +698,12 @@ class VTOLController:
         for i, (la, lo, al) in enumerate(dynamic_waypoints):
             print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}")
 
-        # Gazebo'da her hedef noktasına kırmızı marker spawn et
-        print("[İHA] Gazebo marker'ları oluşturuluyor...")
+        # Gazebo'da her hedef noktasına renkli kutu spawn et
+        gz_world = GZ_WORLD_NAME if GZ_WORLD_NAME else self._detect_gz_world()
+        print("[İHA] Gazebo hedef kutuları oluşturuluyor...")
         for i, (la, lo, _) in enumerate(dynamic_waypoints):
             gx, gy = gps_to_gz_xy(la, lo, home_lat, home_lon)
-            self._spawn_human_marker(f"human_{i+1}", gx, gy)
+            self._spawn_target_box(f"target_{i+1}", gx, gy, gz_world)
 
         # ── Mission yükleme ───────────────────────────────────────────────────
 
@@ -872,40 +873,65 @@ class VTOLController:
     #  GAZEBO MARKER SPAWN
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _spawn_human_marker(self, name, gz_x, gz_y):
+    def _detect_gz_world(self):
         """
-        Gazebo'da belirtilen konuma kırmızı silindir ('insan') model spawn eder.
-        gz service CLI kullanılır; Gazebo çalışmıyorsa sessizce geçer.
+        Çalışan Gazebo dünyasının adını otomatik tespit eder.
+        /world/XXX/create servisini arar.
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["gz", "service", "-l"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("/world/") and line.endswith("/create"):
+                    world = line.split("/")[2]
+                    print(f"[Gazebo] Dünya adı tespit edildi: '{world}'")
+                    return world
+        except Exception:
+            pass
+        print("[Gazebo] Dünya adı tespit edilemedi – 'default' kullanılıyor.")
+        return "default"
+
+    def _spawn_target_box(self, name, gz_x, gz_y, world):
+        """
+        Gazebo'da hedef noktasına büyük renkli kutu koyar.
+        Kutu 2×2×2 m, kırmızı – Gazebo'dan açıkça görünür.
         """
         import subprocess
 
+        colors = [
+            ("1 0.1 0.1", "1 0.1 0.1"),   # kırmızı
+            ("0.1 0.8 0.1", "0.1 0.8 0.1"),  # yeşil
+            ("0.1 0.1 1", "0.1 0.1 1"),   # mavi
+        ]
+        idx   = int(name.split("_")[-1]) - 1
+        amb, dif = colors[idx % len(colors)]
+
         sdf = (
-            '<sdf version="1.6">'
-            f'<model name="{name}"><static>true</static>'
-            '<link name="link">'
-            '<visual name="v">'
-            '<geometry><cylinder><radius>0.35</radius>'
-            '<length>1.8</length></cylinder></geometry>'
-            '<material>'
-            '<ambient>0.9 0.1 0.1 1</ambient>'
-            '<diffuse>0.9 0.1 0.1 1</diffuse>'
-            '</material>'
+            '<sdf version=\\"1.6\\">'
+            f'<model name=\\"{name}\\"><static>true</static>'
+            '<link name=\\"link\\">'
+            '<visual name=\\"v\\">'
+            '<geometry><box><size>2 2 2</size></box></geometry>'
+            f'<material><ambient>{amb} 1</ambient>'
+            f'<diffuse>{dif} 1</diffuse></material>'
             '</visual>'
-            '<collision name="c">'
-            '<geometry><cylinder><radius>0.35</radius>'
-            '<length>1.8</length></cylinder></geometry>'
+            '<collision name=\\"c\\">'
+            '<geometry><box><size>2 2 2</size></box></geometry>'
             '</collision>'
             '</link></model></sdf>'
         )
-        sdf_escaped = sdf.replace('"', '\\"')
         req = (
-            f'sdf: "{sdf_escaped}", '
-            f'pose: {{position: {{x: {gz_x:.2f}, y: {gz_y:.2f}, z: 0.9}}}}'
+            f'sdf: "{sdf}", '
+            f'pose: {{position: {{x: {gz_x:.2f}, y: {gz_y:.2f}, z: 1.0}}}}'
         )
         try:
             result = subprocess.run(
                 ["gz", "service",
-                 "-s", f"/world/{GZ_WORLD_NAME}/create",
+                 "-s", f"/world/{world}/create",
                  "--reqtype", "gz.msgs.EntityFactory",
                  "--reptype", "gz.msgs.Boolean",
                  "--timeout", "3000",
@@ -913,11 +939,11 @@ class VTOLController:
                 capture_output=True, text=True, timeout=6,
             )
             if "true" in result.stdout.lower():
-                print(f"[Gazebo] ✓ '{name}' spawn edildi "
-                      f"(x={gz_x:.1f}m doğu, y={gz_y:.1f}m kuzey)")
+                print(f"[Gazebo] ✓ Hedef kutusu '{name}' oluşturuldu "
+                      f"(x={gz_x:.1f}m, y={gz_y:.1f}m)")
             else:
-                print(f"[Gazebo] '{name}' spawn başarısız – "
-                      f"{result.stderr.strip()[:80]}")
+                print(f"[Gazebo] '{name}' spawn başarısız: "
+                      f"{(result.stderr or result.stdout).strip()[:100]}")
         except Exception as exc:
             print(f"[Gazebo] Spawn hatası: {exc}")
 
