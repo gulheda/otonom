@@ -380,39 +380,71 @@ class VTOLController:
     #  MAVLink YARDIMCILARI
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _set_mode(self, mode_name, timeout=10):
+    def _set_mode(self, mode_name, timeout=15):
         """
         Uçuş modunu değiştirir.
-        ArduPilot COMMAND_ACK veya HEARTBEAT üzerinden onay verir;
-        her ikisi de kontrol edilir.
+        - Her 3 saniyede komutu tekrar gönderir (SET_MODE + MAV_CMD_DO_SET_MODE).
+        - Sadece araçtan (target_system) gelen HEARTBEAT'i onay olarak kabul eder;
+          GCS veya diğer bileşenlerin heartbeat'leri görmezden gelinir.
         """
         mode_id = self.vehicle.mode_mapping().get(mode_name)
         if mode_id is None:
             print(f"[İHA] Bilinmeyen mod: {mode_name}")
             return False
 
-        self.vehicle.mav.set_mode_send(
-            self.vehicle.target_system,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            mode_id,
-        )
-        deadline = time.time() + timeout
+        def _send():
+            self.vehicle.mav.set_mode_send(
+                self.vehicle.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id,
+            )
+            self.vehicle.mav.command_long_send(
+                self.vehicle.target_system,
+                self.vehicle.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id,
+                0, 0, 0, 0, 0,
+            )
+
+        _send()
+        deadline  = time.time() + timeout
+        last_send = time.time()
+
         while time.time() < deadline:
+            # Komut zaman aşımına uğrarsa yeniden gönder
+            if time.time() - last_send >= 3.0:
+                _send()
+                last_send = time.time()
+
             msg = self.vehicle.recv_match(
-                type=["COMMAND_ACK", "HEARTBEAT"], blocking=True, timeout=2)
+                type=["COMMAND_ACK", "HEARTBEAT"], blocking=True, timeout=1)
             if msg is None:
                 continue
-            if msg.get_type() == "COMMAND_ACK":
+
+            if msg.get_type() == "HEARTBEAT":
+                # Yalnızca aracın heartbeat'ini kabul et (GCS/diğer bileşenleri yoksay)
+                if msg.get_srcSystem() != self.vehicle.target_system:
+                    continue
+                if hasattr(msg, "custom_mode") and msg.custom_mode == mode_id:
+                    print(f"[İHA] Mod → {mode_name} (HEARTBEAT onay, mod_id={mode_id})")
+                    return True
+
+            elif msg.get_type() == "COMMAND_ACK":
                 if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
                     print(f"[İHA] Mod → {mode_name} (ACK)")
                     return True
-            elif msg.get_type() == "HEARTBEAT":
-                # ArduPilot çoğunlukla heartbeat üzerinden yeni modu bildirir
-                if hasattr(msg, "custom_mode") and msg.custom_mode == mode_id:
-                    print(f"[İHA] Mod → {mode_name} (HEARTBEAT)")
-                    return True
+
+        # Son çare: mevcut heartbeat'ten modu oku
+        hb = self.vehicle.recv_match(type="HEARTBEAT", blocking=True, timeout=3)
+        if (hb and hb.get_srcSystem() == self.vehicle.target_system
+                and getattr(hb, "custom_mode", None) == mode_id):
+            print(f"[İHA] Mod → {mode_name} (gecikmiş onay)")
+            return True
+
         print(f"[İHA] Mod değiştirme onaylanamadı: {mode_name} "
-              f"(mod_id={mode_id}) – devam ediliyor.")
+              f"(istenen mod_id={mode_id}) – devam ediliyor.")
         return False
 
     def _arm(self):
