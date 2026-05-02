@@ -55,25 +55,43 @@ except TypeError as exc:
 #  KULLANICI TARAFINDAN DÜZENLENECEk BÖLÜM
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Oval tarama alanı merkezi (lat, lon)
+# ── Görev modu ───────────────────────────────────────────────────────────────
+# "WAYPOINT" : 3 sabit noktaya git, koordinatları yazdır, RTL
+# "SCAN"     : oval tarama + YOLO (vision entegrasyonu tamamlandıktan sonra)
+MISSION_MODE = "WAYPOINT"
+
+# ── 3 Görev waypoint'i (lat, lon, irtifa_m) ──────────────────────────────────
+# İstediğin koordinatları buraya gir; VTOL sırayla ziyaret eder.
+MISSION_WAYPOINTS = [
+    (47.3990000, 8.5460000, 50.0),   # Waypoint 1
+    (47.3975000, 8.5480000, 50.0),   # Waypoint 2
+    (47.3965000, 8.5455000, 50.0),   # Waypoint 3
+]
+
+# Waypoint'e ulaşma toleransı ve bekleme süresi
+WP_ARRIVAL_DIST = 8.0    # metre – bu mesafe içinde "ulaşıldı" sayılır
+WP_HOVER_TIME   = 3.0    # saniye – waypoint üzerinde bekleme
+
+# ── Kalkış ───────────────────────────────────────────────────────────────────
+TAKEOFF_ALT  = 50.0    # metre
+CRUISE_SPEED = 10.0    # m/s
+
+# ── Oval tarama (MISSION_MODE="SCAN" için) ───────────────────────────────────
 SCAN_CENTER     = (47.3982419, 8.5465938)
-SCAN_SEMI_MAJOR = 120      # metre – kuzey-güney yarı eksen (uzun taraf)
-SCAN_SEMI_MINOR = 70       # metre – doğu-batı yarı eksen (kısa taraf)
-SCAN_NUM_POINTS = 24       # oval üzerindeki waypoint sayısı
-SCAN_REPEAT     = 0        # tur sayısı (0 = tespit olana kadar sonsuz)
-SCAN_ALT        = 50.0     # metre – tarama irtifası
-SCAN_SPEED      = 10.0     # m/s  – tarama hızı
+SCAN_SEMI_MAJOR = 120
+SCAN_SEMI_MINOR = 70
+SCAN_NUM_POINTS = 24
+SCAN_REPEAT     = 0
+SCAN_ALT        = 50.0
+SCAN_SPEED      = 10.0
 
-# Kalkış
-TAKEOFF_ALT     = 50.0     # metre
+# ── YOLOv8 (MISSION_MODE="SCAN" için) ────────────────────────────────────────
+YOLO_MODEL     = "yolov8n.pt"
+CONFIRM_FRAMES = 5
+CONFIRM_CONF   = 0.70
 
-# YOLOv8 ayarları
-YOLO_MODEL      = "yolov8n.pt"   # model dosyası (yoksa otomatik indirilir)
-CONFIRM_FRAMES  = 5              # art arda kaç frame onayı gerekli
-CONFIRM_CONF    = 0.70           # minimum güven skoru (0-1)
-
-# Kamera parametreleri (Gazebo varsayılan kamera)
-CAMERA_HFOV_DEG = 60.0    # yatay görüş açısı (derece)
+# ── Kamera (MISSION_MODE="SCAN" için) ────────────────────────────────────────
+CAMERA_HFOV_DEG = 60.0
 CAMERA_TOPIC    = "/camera/image"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -363,7 +381,11 @@ class VTOLController:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _set_mode(self, mode_name, timeout=10):
-        """Belirtilen uçuş modunu aktif eder, ACK alana kadar bekler."""
+        """
+        Uçuş modunu değiştirir.
+        ArduPilot COMMAND_ACK veya HEARTBEAT üzerinden onay verir;
+        her ikisi de kontrol edilir.
+        """
         mode_id = self.vehicle.mode_mapping().get(mode_name)
         if mode_id is None:
             print(f"[İHA] Bilinmeyen mod: {mode_name}")
@@ -376,11 +398,21 @@ class VTOLController:
         )
         deadline = time.time() + timeout
         while time.time() < deadline:
-            ack = self.vehicle.recv_match(type="COMMAND_ACK", blocking=True, timeout=2)
-            if ack and ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                print(f"[İHA] Mod → {mode_name}")
-                return True
-        print(f"[İHA] Mod değiştirme onaylanamadı: {mode_name}")
+            msg = self.vehicle.recv_match(
+                type=["COMMAND_ACK", "HEARTBEAT"], blocking=True, timeout=2)
+            if msg is None:
+                continue
+            if msg.get_type() == "COMMAND_ACK":
+                if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    print(f"[İHA] Mod → {mode_name} (ACK)")
+                    return True
+            elif msg.get_type() == "HEARTBEAT":
+                # ArduPilot çoğunlukla heartbeat üzerinden yeni modu bildirir
+                if hasattr(msg, "custom_mode") and msg.custom_mode == mode_id:
+                    print(f"[İHA] Mod → {mode_name} (HEARTBEAT)")
+                    return True
+        print(f"[İHA] Mod değiştirme onaylanamadı: {mode_name} "
+              f"(mod_id={mode_id}) – devam ediliyor.")
         return False
 
     def _arm(self):
@@ -571,18 +603,80 @@ class VTOLController:
         print("[Görüntü] İşleme döngüsü sonlandı.")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  ALAN TARAMA DÖNGÜSÜ
+    #  WAYPOINT GÖREV DÖNGÜSÜ  (MISSION_MODE = "WAYPOINT")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _waypoint_mission(self):
+        """
+        MISSION_WAYPOINTS listesindeki 3 noktayı sırayla ziyaret eder.
+        Her noktaya ulaşınca koordinatları yazdırır (drone'a sonradan aktarılacak).
+        Tüm waypoint'ler tamamlanınca RTL yapar.
+        """
+        self._set_mode("GUIDED")
+        self._set_speed(CRUISE_SPEED)
+
+        visited = []   # ziyaret edilen koordinatlar (drone için)
+
+        print(f"\n[İHA] WAYPOINT görevi başlıyor – "
+              f"{len(MISSION_WAYPOINTS)} nokta")
+
+        for idx, (wp_lat, wp_lon, wp_alt) in enumerate(MISSION_WAYPOINTS):
+            if not self.mission_active:
+                break
+
+            print(f"\n[İHA] ── WAYPOINT {idx+1}/{len(MISSION_WAYPOINTS)} ──")
+            print(f"[İHA] Hedef: lat={wp_lat:.6f}  lon={wp_lon:.6f}  "
+                  f"alt={wp_alt:.1f}m")
+
+            self._goto(wp_lat, wp_lon, wp_alt)
+
+            # Hedefe ulaşana kadar bekle
+            while self.mission_active:
+                lat, lon, alt, _ = self._get_position()
+                if lat is None:
+                    time.sleep(0.5)
+                    continue
+                dist = haversine(lat, lon, wp_lat, wp_lon)
+                print(f"[İHA] Mesafe: {dist:.1f} m", end="\r")
+                if dist < WP_ARRIVAL_DIST:
+                    print()
+                    break
+                time.sleep(1.0)
+
+            # Ulaşıldı – koordinatı kaydet ve yazdır
+            cur_lat, cur_lon, cur_alt, _ = self._get_position()
+            if cur_lat is None:
+                cur_lat, cur_lon, cur_alt = wp_lat, wp_lon, wp_alt
+
+            visited.append((cur_lat, cur_lon, cur_alt))
+            print("─" * 50)
+            print(f"  [İHA] WAYPOINT {idx+1} ULAŞILDI")
+            print(f"  latitude  : {cur_lat:.7f}")
+            print(f"  longitude : {cur_lon:.7f}")
+            print(f"  altitude  : {cur_alt:.1f} m")
+            print("─" * 50)
+
+            # Waypoint üzerinde kısa bekleme
+            time.sleep(WP_HOVER_TIME)
+
+        # Tüm waypoint'ler tamamlandı – özet
+        print("\n" + "═" * 55)
+        print("  [İHA] TÜM WAYPOINT'LER TAMAMLANDI – KOORDİNATLAR")
+        print("═" * 55)
+        for i, (la, lo, al) in enumerate(visited):
+            print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}  alt={al:.1f}m")
+        print("═" * 55)
+
+        self._rtl()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  OVAL TARAMA DÖNGÜSÜ  (MISSION_MODE = "SCAN")
     # ─────────────────────────────────────────────────────────────────────────
 
     def _scan_loop(self):
         """
         Oval waypoint'leri sırayla gezerek alan taraması yapar.
-
-        SCAN_REPEAT = 0  → insan tespit edilene kadar sonsuz döngü
-        SCAN_REPEAT > 0  → belirlenen tur sayısı tamamlanana kadar
-
-        Her waypoint'e giderken _target_found bayrağı kontrol edilir;
-        tespit onaylandığında döngü kırılır ve tespit akışına geçilir.
+        SCAN_REPEAT=0 → insan tespit edilene kadar sonsuz döngü.
         """
         self._set_mode("GUIDED")
         self._set_speed(SCAN_SPEED)
@@ -593,26 +687,19 @@ class VTOLController:
               f"{total_wps} waypoint, merkez={SCAN_CENTER}, irtifa={SCAN_ALT}m")
 
         while self.mission_active:
-            # Tespit onaylandıysa taramayı kes
             if self._target_found:
                 break
-
             tur += 1
             if SCAN_REPEAT > 0 and tur > SCAN_REPEAT:
                 print(f"[İHA] {SCAN_REPEAT} tur tamamlandı – tespit yapılamadı.")
                 break
-
             print(f"\n[İHA] ── TUR {tur} ──")
-
             for wp_idx, (wp_lat, wp_lon, wp_alt) in enumerate(self.waypoints):
                 if not self.mission_active or self._target_found:
                     break
-
                 self._goto(wp_lat, wp_lon, wp_alt)
                 print(f"[İHA] WP {wp_idx+1:2d}/{total_wps} "
                       f"→ ({wp_lat:.5f}, {wp_lon:.5f})", end="  ")
-
-                # Waypoint'e ulaşana kadar bekle (5m tolerans)
                 while self.mission_active and not self._target_found:
                     lat, lon, _, _ = self._get_position()
                     if lat is None:
@@ -623,7 +710,6 @@ class VTOLController:
                         break
                     time.sleep(1.0)
 
-        # Tespit varsa işle; yoksa RTL
         if self._target_found:
             self._handle_detection()
         else:
@@ -677,13 +763,15 @@ class VTOLController:
         print("\n" + "═" * 60)
         print("  VTOL İHA – OTONOM GÖREV SİSTEMİ")
         print("═" * 60)
-        print(f"  MAVLink bağlantısı : {VTOL_CONNECTION}")
-        print(f"  Kamera topic       : {CAMERA_TOPIC}")
-        print(f"  YOLO modeli        : {YOLO_MODEL}")
-        print(f"  Onay frame sayısı  : {CONFIRM_FRAMES}")
-        print(f"  Güven eşiği        : {CONFIRM_CONF}")
-        print(f"  Tarama irtifası    : {SCAN_ALT} m")
-        print(f"  Oval merkezi       : {SCAN_CENTER}")
+        print(f"  Görev modu         : {MISSION_MODE}")
+        print(f"  MAVLink            : {VTOL_CONNECTION}")
+        if MISSION_MODE == "WAYPOINT":
+            for i, wp in enumerate(MISSION_WAYPOINTS):
+                print(f"  WP{i+1}               : "
+                      f"lat={wp[0]:.6f}  lon={wp[1]:.6f}  alt={wp[2]:.0f}m")
+        else:
+            print(f"  Kamera topic       : {CAMERA_TOPIC}")
+            print(f"  YOLO modeli        : {YOLO_MODEL}")
         print("═" * 60 + "\n")
 
         # 1. MAVLink bağlantısı
@@ -691,25 +779,26 @@ class VTOLController:
             print("[İHA] MAVLink bağlantısı kurulamadı – çıkılıyor.")
             return
 
-        # 2. Gazebo kamera başlat
-        cam_ok = self.camera.start()
-        if not cam_ok:
-            print("[İHA] Gazebo kamerası başlatılamadı. "
-                  "Görüntü işleme çalışmayacak.")
+        # 2. Vision sadece SCAN modunda başlar
+        if MISSION_MODE == "SCAN":
+            cam_ok = self.camera.start()
+            if not cam_ok:
+                print("[İHA] Gazebo kamerası başlatılamadı.")
+            vision_th = threading.Thread(target=self._vision_loop, daemon=True)
+            vision_th.start()
 
-        # 3. Görüntü işleme thread'ini arka planda başlat
-        vision_th = threading.Thread(target=self._vision_loop, daemon=True)
-        vision_th.start()
-
-        # 4. Kalkış
+        # 3. Kalkış
         self._set_mode("GUIDED")
         time.sleep(1)
         self._arm()
         self._takeoff(TAKEOFF_ALT)
 
-        # 5. Alan taraması + tespit döngüsü
+        # 4. Görev döngüsü
         try:
-            self._scan_loop()
+            if MISSION_MODE == "WAYPOINT":
+                self._waypoint_mission()
+            else:
+                self._scan_loop()
         except KeyboardInterrupt:
             print("\n[İHA] Kullanıcı tarafından durduruldu.")
             self.mission_active = False
