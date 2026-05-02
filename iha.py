@@ -13,15 +13,17 @@ Bağımlılıklar:
 """
 
 import os
+
+# GZ_MSGS protobuf uyumsuzluğu: gz.msgs10 eski protobuf (< 3.19) ile derlendi.
+# google-protobuf 4.x pure-Python parser'a geçilmezse TypeError fırlatır.
+# Bu satır tüm diğer importlardan ÖNCE olmalıdır.
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import time
 import math
 import threading
 import socket
 import json
-
-# gz.msgs10 eski protobuf ile derlendi; yeni protobuf sürümleriyle uyumlu çalışması için
-# pure-Python implementasyonu zorunlu kılınır (performans kaybı ihmal edilebilir ölçüde).
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import cv2
 import numpy as np
