@@ -492,17 +492,29 @@ class VTOLController:
         return lat, lon, alt_m, yaw_deg
 
     def _goto(self, lat, lon, alt):
-        """GUIDED modda belirtilen GPS noktasına git komutu gönderir."""
+        """
+        Belirtilen GPS noktasına git komutu gönderir.
+        ArduCopter tarzı SET_POSITION_TARGET + ArduPlane tarzı DO_REPOSITION
+        birlikte gönderilir; VTOL firmware'i hangisini destekliyorsa kullanır.
+        """
         self.vehicle.mav.set_position_target_global_int_send(
             0,
             self.vehicle.target_system,
             self.vehicle.target_component,
             mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-            0b0000_1111_1111_1000,   # yalnızca konum (hız/ivme yoksay)
+            0b0000_1111_1111_1000,
             int(lat * 1e7), int(lon * 1e7), alt,
-            0, 0, 0,
-            0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+        )
+        # ArduPlane GUIDED navigasyon komutu
+        self.vehicle.mav.command_int_send(
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavutil.mavlink.MAV_CMD_DO_REPOSITION,
             0, 0,
+            -1, 0, 0, float("nan"),
+            int(lat * 1e7), int(lon * 1e7), alt,
         )
 
     def _set_speed(self, speed_ms):
@@ -640,17 +652,44 @@ class VTOLController:
 
     def _waypoint_mission(self):
         """
-        MISSION_WAYPOINTS listesindeki 3 noktayı sırayla ziyaret eder.
-        Her noktaya ulaşınca koordinatları yazdırır (drone'a sonradan aktarılacak).
-        Tüm waypoint'ler tamamlanınca RTL yapar.
+        MISSION_WAYPOINTS listesindeki noktaları AUTO mod ile ziyaret eder.
+
+        Akış:
+          1. Mevcut konumu home olarak al.
+          2. Mission yükle: home + WP'ler + RTL.
+          3. AUTO moda geç (araç sırayla WP'leri ziyaret eder).
+          4. Her WP'e ulaşınca koordinatları yazdır.
+          5. Tüm WP'ler bitti → RTL.
+
+        AUTO mod başarısız olursa GUIDED + DO_REPOSITION fallback kullanılır.
         """
-        self._set_mode("GUIDED")
         self._set_speed(CRUISE_SPEED)
+        print(f"\n[İHA] WAYPOINT görevi başlıyor – {len(MISSION_WAYPOINTS)} nokta")
 
-        visited = []   # ziyaret edilen koordinatlar (drone için)
+        # ── Mission yükleme ───────────────────────────────────────────────────
+        home_lat, home_lon, home_alt, _ = self._get_position()
+        if home_lat is None:
+            home_lat, home_lon, home_alt = (
+                MISSION_WAYPOINTS[0][0], MISSION_WAYPOINTS[0][1], TAKEOFF_ALT)
 
-        print(f"\n[İHA] WAYPOINT görevi başlıyor – "
-              f"{len(MISSION_WAYPOINTS)} nokta")
+        self._clear_mission()
+        time.sleep(0.5)
+        mission_ok = self._upload_waypoints_mission(home_lat, home_lon, home_alt)
+
+        if mission_ok:
+            # Item 1 = ilk waypoint; AUTO mod buradan başlasın
+            self._set_current_mission_item(1)
+            auto_ok = self._set_mode("AUTO")
+            if not auto_ok:
+                print("[İHA] AUTO mod onaylanamadı – yine de devam ediliyor.")
+            use_auto = True
+        else:
+            print("[İHA] Mission yüklenemedi – GUIDED/DO_REPOSITION ile devam.")
+            self._set_mode("GUIDED")
+            use_auto = False
+
+        # ── Waypoint döngüsü ──────────────────────────────────────────────────
+        visited = []
 
         for idx, (wp_lat, wp_lon, wp_alt) in enumerate(MISSION_WAYPOINTS):
             if not self.mission_active:
@@ -660,9 +699,10 @@ class VTOLController:
             print(f"[İHA] Hedef: lat={wp_lat:.6f}  lon={wp_lon:.6f}  "
                   f"alt={wp_alt:.1f}m")
 
-            self._goto(wp_lat, wp_lon, wp_alt)
+            if not use_auto:
+                # GUIDED fallback: her saniye komutu yenile (ArduPlane timeout'u var)
+                self._goto(wp_lat, wp_lon, wp_alt)
 
-            # Hedefe ulaşana kadar bekle
             while self.mission_active:
                 lat, lon, alt, _ = self._get_position()
                 if lat is None:
@@ -673,9 +713,12 @@ class VTOLController:
                 if dist < WP_ARRIVAL_DIST:
                     print()
                     break
+                if not use_auto:
+                    # ArduPlane GUIDED hedefi periyodik olarak yenile
+                    self._goto(wp_lat, wp_lon, wp_alt)
                 time.sleep(1.0)
 
-            # Ulaşıldı – koordinatı kaydet ve yazdır
+            # Ulaşıldı
             cur_lat, cur_lon, cur_alt, _ = self._get_position()
             if cur_lat is None:
                 cur_lat, cur_lon, cur_alt = wp_lat, wp_lon, wp_alt
@@ -687,11 +730,9 @@ class VTOLController:
             print(f"  longitude : {cur_lon:.7f}")
             print(f"  altitude  : {cur_alt:.1f} m")
             print("─" * 50)
-
-            # Waypoint üzerinde kısa bekleme
             time.sleep(WP_HOVER_TIME)
 
-        # Tüm waypoint'ler tamamlandı – özet
+        # ── Özet ve RTL ───────────────────────────────────────────────────────
         print("\n" + "═" * 55)
         print("  [İHA] TÜM WAYPOINT'LER TAMAMLANDI – KOORDİNATLAR")
         print("═" * 55)
@@ -774,6 +815,112 @@ class VTOLController:
         # Drone'un koordinatı alması için bekle, sonra dön
         time.sleep(5)
         self._rtl()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  MİSSION YÜKLEME YARDIMCILARI
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _clear_mission(self):
+        """Araçtaki mevcut mission'ı siler."""
+        self.vehicle.mav.mission_clear_all_send(
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+            mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+        )
+        ack = self.vehicle.recv_match(type="MISSION_ACK", blocking=True, timeout=5)
+        if ack:
+            print("[İHA] Eski mission temizlendi.")
+
+    def _upload_waypoints_mission(self, home_lat, home_lon, home_alt):
+        """
+        Araç zaten havada; mission yükler:
+          item 0 : home (mevcut konum)
+          item 1 : WP1  (current=1 → buradan başla)
+          item 2 : WP2
+          item 3 : WP3
+          item 4 : RTL
+        AUTO moduna geçince araç sırayla WP'leri ziyaret edip RTL yapar.
+        """
+        wps = MISSION_WAYPOINTS
+        items = []
+
+        # Item 0: Home
+        items.append((0,
+                       mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                       mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                       0, 1,
+                       0.0, 0.0, 0.0, 0.0,
+                       int(home_lat * 1e7), int(home_lon * 1e7), float(home_alt)))
+
+        # Items 1..n: Waypoints
+        for i, (lat, lon, alt) in enumerate(wps):
+            items.append((i + 1,
+                           mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                           mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                           0, 1,
+                           0.0, float(WP_ARRIVAL_DIST), 0.0, float("nan"),
+                           int(lat * 1e7), int(lon * 1e7), float(alt)))
+
+        # Item n+1: RTL
+        items.append((len(wps) + 1,
+                       mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                       mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                       0, 1,
+                       0.0, 0.0, 0.0, 0.0,
+                       0, 0, 0.0))
+
+        total = len(items)
+        print(f"[İHA] Mission yükleniyor ({total} item: home + "
+              f"{len(wps)} WP + RTL)...")
+
+        self.vehicle.mav.mission_count_send(
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+            total,
+            mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+        )
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            msg = self.vehicle.recv_match(
+                type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"],
+                blocking=True, timeout=5,
+            )
+            if msg is None:
+                continue
+
+            if msg.get_type() == "MISSION_ACK":
+                ok = msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED
+                print(f"[İHA] Mission {'yüklendi ✓' if ok else 'HATA: ' + str(msg.type)}")
+                return ok
+
+            seq = msg.seq
+            if seq >= total:
+                continue
+
+            it = items[seq]
+            self.vehicle.mav.mission_item_int_send(
+                self.vehicle.target_system,
+                self.vehicle.target_component,
+                it[0], it[1], it[2], it[3], it[4],
+                it[5], it[6], it[7], it[8],
+                it[9], it[10], it[11],
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+            )
+
+        print("[İHA] Mission yükleme timeout!")
+        return False
+
+    def _set_current_mission_item(self, seq):
+        """Araca hangi mission item'dan başlayacağını bildirir."""
+        self.vehicle.mav.mission_set_current_send(
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+            seq,
+        )
+        msg = self.vehicle.recv_match(type="MISSION_CURRENT", blocking=True, timeout=5)
+        if msg:
+            print(f"[İHA] Mission başlangıç item: {msg.seq}")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  GÖREV SONU
