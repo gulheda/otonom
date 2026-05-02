@@ -716,10 +716,20 @@ class VTOLController:
                 # GUIDED fallback: her saniye komutu yenile (ArduPlane timeout'u var)
                 self._goto(wp_lat, wp_lon, wp_alt)
 
+            # AUTO modda araç hızlı geçebilir; hem MISSION_ITEM_REACHED hem
+            # mesafe kontrolü birlikte kullanılır.
+            mission_seq = idx + 1   # item 0 = home, item 1 = WP1, ...
             while self.mission_active:
+                # MISSION_ITEM_REACHED – non-blocking, öncelikli kontrol
+                mreach = self.vehicle.recv_match(
+                    type="MISSION_ITEM_REACHED", blocking=False)
+                if mreach is not None and mreach.seq >= mission_seq:
+                    print(f"\n[İHA] Mission item {mreach.seq} tamamlandı.")
+                    break
+
                 lat, lon, alt, _ = self._get_position()
                 if lat is None:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
                 dist = haversine(lat, lon, wp_lat, wp_lon)
                 print(f"[İHA] Mesafe: {dist:.1f} m", end="\r")
@@ -727,9 +737,8 @@ class VTOLController:
                     print()
                     break
                 if not use_auto:
-                    # ArduPlane GUIDED hedefi periyodik olarak yenile
                     self._goto(wp_lat, wp_lon, wp_alt)
-                time.sleep(1.0)
+                time.sleep(0.3)
 
             # Ulaşıldı
             cur_lat, cur_lon, cur_alt, _ = self._get_position()
