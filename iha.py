@@ -12,11 +12,16 @@ Bağımlılıklar:
     (gz.transport13 Gazebo Harmonic ile birlikte kurulur)
 """
 
+import os
 import time
 import math
 import threading
 import socket
 import json
+
+# gz.msgs10 eski protobuf ile derlendi; yeni protobuf sürümleriyle uyumlu çalışması için
+# pure-Python implementasyonu zorunlu kılınır (performans kaybı ihmal edilebilir ölçüde).
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import cv2
 import numpy as np
@@ -38,6 +43,10 @@ try:
 except ImportError:
     GZ_AVAILABLE = False
     print("[UYARI] 'gz.transport13' bulunamadı. Gazebo kamera devre dışı.")
+except TypeError as exc:
+    # Protobuf sürüm uyumsuzluğu hâlâ çözülemediyse bilgi ver
+    GZ_AVAILABLE = False
+    print(f"[UYARI] gz.msgs10 yüklenemedi (protobuf uyumsuzluğu): {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
