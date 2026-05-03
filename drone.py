@@ -30,13 +30,17 @@ STANDBY_ALT = 25.0        # metre
 #  SİSTEM YAPILANDIRMASI (normalde dokunmayın)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DRONE_CONNECTION = "udp:127.0.0.1:14560"
-DRONE_SYSID      = 2
-MSG_LISTEN_PORT  = 6000       # iha.py'den hedef alınacak UDP portu
+# Gerçek drone bağlantısı – fiziksel bağlantı tipine göre birini seç:
+# USB/telemetri kablosu : "/dev/ttyUSB0:57600"
+# WiFi/UDP             : "udp:192.168.4.1:14550"
+# SITL (test)          : "udp:127.0.0.1:14560"
+DRONE_CONNECTION = "/dev/ttyUSB0:57600"
+DRONE_SYSID      = 1           # Gerçek ArduCopter varsayılanı (SITL'de 2 idi)
+MSG_LISTEN_PORT  = 6000        # iha.py'den hedef alınacak UDP portu
 
-CRUISE_ALT       = 25.0       # metre – seyir irtifası
-DELIVERY_ALT     = 5.0        # metre – payload bırakma irtifası
-ARRIVAL_DIST     = 3.0        # metre – hedefe bu kadar yaklaşınca "ulaşıldı" sayılır
+CRUISE_ALT       = 25.0        # metre – seyir irtifası
+DELIVERY_ALT     = 5.0         # metre – payload bırakma irtifası
+ARRIVAL_DIST     = 6.0         # metre – GPS ±2-3m hata payı için 6m (SITL'de 3m idi)
 
 CRUISE_SPEED     = 8.0        # m/s
 IDLE_SPEED       = 2.0        # m/s – smart idle sürüklenme hızı
@@ -394,17 +398,14 @@ class DroneController:
                 break
             time.sleep(0.8)
 
-        print(f"[Drone] Hedefe ulaşıldı – irtifa azaltılıyor "
-              f"({alt:.0f}m → {DELIVERY_ALT}m)...")
-        self._change_altitude(DELIVERY_ALT)
-
-        # Payload bırak
-        self._drop_payload()
-        time.sleep(1)
-
-        # Seyir irtifasına geri dön
-        print(f"[Drone] Seyir irtifasına yükseliyor ({DELIVERY_ALT}m → {CRUISE_ALT}m)...")
-        self._change_altitude(CRUISE_ALT)
+        print(f"[Drone] Hedefe ulaşıldı.")
+        # NOT: Payload (iniş + servo + yükseliş) ilk test uçuşunda devre dışı.
+        # Etkinleştirmek için aşağıdaki 6 satırın başındaki '#' karakterini kaldır:
+        # self._change_altitude(DELIVERY_ALT)
+        # self._drop_payload()
+        # time.sleep(1)
+        # print(f"[Drone] Seyir irtifasına yükseliyor ({DELIVERY_ALT}m → {CRUISE_ALT}m)...")
+        # self._change_altitude(CRUISE_ALT)
 
         print(f"[Drone] Teslimat #{n} tamamlandı.")
         self._last_task_ts = time.time()
