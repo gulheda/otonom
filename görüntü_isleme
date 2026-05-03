@@ -1,0 +1,52 @@
+cat > ~/yolo_test.py << 'EOF'
+import os
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
+
+from ultralytics import YOLO
+import cv2
+import numpy as np
+from gz.transport13 import Node
+from gz.msgs10.image_pb2 import Image
+import time
+
+latest_frame = [None]
+node = Node()
+
+def image_callback(msg):
+    img = np.frombuffer(msg.data, dtype=np.uint8)
+    img = img.reshape((msg.height, msg.width, 3))
+    latest_frame[0] = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+node.subscribe(Image, '/camera/image', image_callback)
+print("Gazebo kamerasi bekleniyor...")
+
+model = YOLO("yolov8n.pt")
+
+while True:
+    if latest_frame[0] is None:
+        time.sleep(0.05)
+        continue
+
+    frame = latest_frame[0].copy()
+    results = model(frame, conf=0.5)
+
+    for r in results:
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            if cls == 0:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.putText(frame, f"INSAN {conf:.2f}",
+                            (x1, y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0,255,0), 2)
+                print(f"KAZAZEDE TESPIT! Piksel: ({(x1+x2)//2}, {(y1+y2)//2})")
+
+    cv2.imshow("Insan Tespit", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cv2.destroyAllWindows()
+EOF
+echo "Hazir!"
