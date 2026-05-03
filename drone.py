@@ -23,9 +23,7 @@ from pymavlink import mavutil
 #  KULLANICI TARAFINDAN DÜZENLENECEk BÖLÜM
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Görev tamamlandıktan sonra dönülecek güvenli standby noktası
-STANDBY_LAT = 47.3977419
-STANDBY_LON = 8.5455938
+# Standby noktası başlangıçta araç konumundan dinamik okunur (run() içinde)
 STANDBY_ALT = 25.0        # metre
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,6 +112,10 @@ class DroneController:
         # Tamamlanan teslimat sayısı
         self._deliveries_done = 0
 
+        # Standby noktası – run() içinde araç spawn konumundan okunur
+        self.standby_lat      = None
+        self.standby_lon      = None
+
     # ─────────────────────────────────────────────────────────────────────────
     #  BAĞLANTI
     # ─────────────────────────────────────────────────────────────────────────
@@ -141,24 +143,49 @@ class DroneController:
     #  MAVLink YARDIMCILARI
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _set_mode(self, mode_name, timeout=10):
-        """Uçuş modunu değiştirir ve ACK bekler."""
+    def _set_mode(self, mode_name, timeout=15):
+        """Uçuş modunu değiştirir; hem COMMAND_ACK hem HEARTBEAT ile onay bekler."""
         mode_id = self.vehicle.mode_mapping().get(mode_name)
         if mode_id is None:
             print(f"[Drone] Bilinmeyen mod: {mode_name}")
             return False
 
-        self.vehicle.mav.set_mode_send(
-            self.vehicle.target_system,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            mode_id,
-        )
-        deadline = time.time() + timeout
+        def _send():
+            self.vehicle.mav.set_mode_send(
+                self.vehicle.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id,
+            )
+            self.vehicle.mav.command_long_send(
+                self.vehicle.target_system,
+                self.vehicle.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id,
+                0, 0, 0, 0, 0,
+            )
+
+        _send()
+        deadline, last_send = time.time() + timeout, time.time()
         while time.time() < deadline:
-            ack = self.vehicle.recv_match(type="COMMAND_ACK", blocking=True, timeout=2)
-            if ack and ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                print(f"[Drone] Mod → {mode_name}")
-                return True
+            if time.time() - last_send >= 3.0:
+                _send()
+                last_send = time.time()
+            msg = self.vehicle.recv_match(
+                type=["COMMAND_ACK", "HEARTBEAT"], blocking=True, timeout=1)
+            if msg is None:
+                continue
+            if msg.get_type() == "HEARTBEAT":
+                if msg.get_srcSystem() != self.vehicle.target_system:
+                    continue
+                if getattr(msg, "custom_mode", None) == mode_id:
+                    print(f"[Drone] Mod → {mode_name}")
+                    return True
+            elif msg.get_type() == "COMMAND_ACK":
+                if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    print(f"[Drone] Mod → {mode_name}")
+                    return True
         print(f"[Drone] Mod değiştirme onaylanamadı: {mode_name}")
         return False
 
@@ -204,6 +231,7 @@ class DroneController:
 
     def _goto(self, lat, lon, alt):
         """GUIDED modda belirtilen konuma git komutu gönderir."""
+        # ArduCopter
         self.vehicle.mav.set_position_target_global_int_send(
             0,
             self.vehicle.target_system,
@@ -214,6 +242,19 @@ class DroneController:
             0, 0, 0,
             0, 0, 0,
             0, 0,
+        )
+        # ArduPlane
+        self.vehicle.mav.command_int_send(
+            self.vehicle.target_system,
+            self.vehicle.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            mavutil.mavlink.MAV_CMD_DO_REPOSITION,
+            0, 0,
+            -1,
+            mavutil.mavlink.MAV_DO_REPOSITION_FLAGS_CHANGE_MODE,
+            0,
+            float("nan"),
+            int(lat * 1e7), int(lon * 1e7), alt,
         )
 
     def _set_speed(self, speed_ms):
@@ -398,9 +439,9 @@ class DroneController:
                 # Standby noktasına git
                 print(f"[Drone] Idle timeout ({IDLE_TIMEOUT:.0f}s) – "
                       f"standby noktasına gidiliyor: "
-                      f"({STANDBY_LAT:.5f}, {STANDBY_LON:.5f})")
+                      f"({self.standby_lat:.5f}, {self.standby_lon:.5f})")
                 self._set_speed(CRUISE_SPEED)
-                self._goto(STANDBY_LAT, STANDBY_LON, STANDBY_ALT)
+                self._goto(self.standby_lat, self.standby_lon, STANDBY_ALT)
 
                 # Standby'da yeni hedef bekle
                 while self.mission_active:
@@ -474,7 +515,9 @@ class DroneController:
         print(f"  Payload irtifası   : {DELIVERY_ALT} m")
         print(f"  Servo kanalı       : {PAYLOAD_SERVO_CH}")
         print(f"  Idle timeout       : {IDLE_TIMEOUT} s")
-        print(f"  Standby noktası    : ({STANDBY_LAT:.5f}, {STANDBY_LON:.5f})")
+        slat = f"{self.standby_lat:.5f}" if self.standby_lat else "dinamik (henüz okunmadı)"
+        slon = f"{self.standby_lon:.5f}" if self.standby_lon else ""
+        print(f"  Standby noktası    : ({slat}, {slon})")
         print("═" * 60 + "\n")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -489,11 +532,25 @@ class DroneController:
             print("[Drone] MAVLink bağlantısı kurulamadı – çıkılıyor.")
             return
 
-        # 2. UDP hedef dinleyicisini arka planda başlat
+        # 2. Spawn konumunu oku → standby noktası olarak kaydet
+        print("[Drone] Başlangıç konumu okunuyor...")
+        home_lat, home_lon, _ = self._get_position()
+        if home_lat is None:
+            print("[Drone] GPS alınamadı – 5s beklenip tekrar deneniyor...")
+            time.sleep(5)
+            home_lat, home_lon, _ = self._get_position()
+        if home_lat is not None:
+            self.standby_lat = home_lat
+            self.standby_lon = home_lon
+            print(f"[Drone] Standby noktası: ({home_lat:.6f}, {home_lon:.6f})")
+        else:
+            print("[Drone] UYARI: GPS alınamadı, standby konumu ayarlanamadı.")
+
+        # 3. UDP hedef dinleyicisini arka planda başlat
         sock_th = threading.Thread(target=self._socket_listener, daemon=True)
         sock_th.start()
 
-        # 3. Kalkış hazırlığı
+        # 4. Kalkış hazırlığı
         print("[Drone] İHA'dan koordinat bekleniyor ve kalkış hazırlanıyor...")
         self._set_mode("STABILIZE")
         time.sleep(1)
@@ -501,7 +558,7 @@ class DroneController:
         self._set_mode("GUIDED")
         self._takeoff(CRUISE_ALT)
 
-        # 4. Görev döngüsü (hedef bekleme + teslimat + smart idle)
+        # 5. Görev döngüsü (hedef bekleme + teslimat + smart idle)
         try:
             self._mission_loop()
         except KeyboardInterrupt:
