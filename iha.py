@@ -1,14 +1,17 @@
 """
-VTOL İHA – 3 Waypoint Görevi
-==============================
+VTOL İHA – 3 Waypoint Görevi + Hedef Tespiti
+==============================================
 Araç  : alti_transition_quad (ArduPlane VTOL)
 SysID : 1  |  UDP : 14550
 Görev : Kalkış → 3 WP → RTL
+        Uçuş sırasında on_target_detected() çağrılırsa:
+        → GUIDED/LOITER → Servo aç/kapa → AUTO devam
 """
 
 import time
 import math
 import threading
+from enum import Enum, auto
 from pymavlink import mavutil
 
 
@@ -19,20 +22,37 @@ from pymavlink import mavutil
 VTOL_CONNECTION = "udp:127.0.0.1:14550"
 VTOL_SYSID      = 1
 
-TAKEOFF_ALT  = 30.0   # metre
-CRUISE_SPEED = 5.0    # m/s
-WP_ALT       = 30.0   # metre – waypoint irtifası
-WP_ARRIVAL_DIST = 10.0   # metre – bu kadar yaklaşınca "ulaşıldı"
-WP_HOVER_TIME   = 3.0    # saniye – waypoint'te bekleme
+TAKEOFF_ALT     = 30.0   # metre
+CRUISE_SPEED    = 5.0    # m/s
+WP_ALT          = 30.0   # metre
+WP_ARRIVAL_DIST = 10.0   # metre
+WP_HOVER_TIME   = 3.0    # saniye
+
+# ── Servo ─────────────────────────────────────────────────────────────────────
+SERVO_CHANNEL   = 8      # RC çıkış kanalı
+SERVO_OPEN_PWM  = 1900   # µs – yük bırakma
+SERVO_CLOSE_PWM = 1100   # µs – kilit
 
 # ── 3 Hedef Koordinat ────────────────────────────────────────────────────────
-# Enlem (lat), Boylam (lon), İrtifa (m) olarak girin.
-# Örnek: Kalkış noktasına göre 50m kuzey/doğu/güney.
 WAYPOINTS = [
     (-35.3628102, 149.1652074, WP_ALT),   # WP1
     (-35.3632594, 149.1657582, WP_ALT),   # WP2
     (-35.3637086, 149.1652074, WP_ALT),   # WP3
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DURUM MAKİNESİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MissionState(Enum):
+    TAKEOFF         = auto()
+    SEARCH          = auto()
+    TARGET_DETECTED = auto()
+    HOLD            = auto()
+    DROP            = auto()
+    RESUME_SEARCH   = auto()
+    RTL             = auto()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -57,6 +77,20 @@ class VTOLController:
     def __init__(self):
         self.vehicle        = None
         self.mission_active = True
+        self.state          = MissionState.TAKEOFF
+
+        # Hedef tespiti için sinyal – dışarıdan on_target_detected() ile set edilir
+        self.target_event    = threading.Event()
+        self.target_position = None   # (lat, lon, alt)
+
+    # ── Dışarıdan çağrılacak tetik – ileride kamera kodu buraya bağlanır ─────
+
+    def on_target_detected(self, lat, lon, alt):
+        """Görüntü işleme (veya manuel test) hedef bulduğunda çağırır."""
+        self.target_position = (lat, lon, alt)
+        self.target_event.set()
+        print(f"\n[İHA] ★ Hedef tespit sinyali alındı: "
+              f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.1f}m")
 
     # ── Bağlantı ─────────────────────────────────────────────────────────────
 
@@ -184,6 +218,53 @@ class VTOLController:
             mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
             0, 1, speed_ms, -1, 0, 0, 0, 0)
 
+    # ── Servo ─────────────────────────────────────────────────────────────────
+
+    def _set_servo_pwm(self, channel, pwm):
+        self.vehicle.mav.command_long_send(
+            self.vehicle.target_system, self.vehicle.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0, channel, pwm, 0, 0, 0, 0, 0)
+
+    def _drop_payload(self):
+        """Servo aç → bekle → kapat."""
+        self.state = MissionState.DROP
+        print(f"[İHA] Servo açılıyor  – kanal {SERVO_CHANNEL}, {SERVO_OPEN_PWM} µs")
+        self._set_servo_pwm(SERVO_CHANNEL, SERVO_OPEN_PWM)
+        time.sleep(1.5)
+        print(f"[İHA] Servo kapanıyor – kanal {SERVO_CHANNEL}, {SERVO_CLOSE_PWM} µs")
+        self._set_servo_pwm(SERVO_CHANNEL, SERVO_CLOSE_PWM)
+        print("[İHA] Servo tamamlandı.")
+
+    # ── Hedef işleme ──────────────────────────────────────────────────────────
+
+    def _handle_target(self):
+        """
+        target_event set olduğunda çağrılır.
+        AUTO → GUIDED/LOITER dur → servo → AUTO devam
+        """
+        self.state = MissionState.HOLD
+        lat, lon, alt = self.target_position or (None, None, None)
+        print(f"[İHA] Hedef işleniyor – duruluyor...")
+
+        # Durdur: önce GUIDED dene, olmazsa LOITER
+        if not self._set_mode("GUIDED"):
+            self._set_mode("LOITER")
+        time.sleep(2)
+
+        # Servo
+        self._drop_payload()
+
+        # Event'i temizle, konumu sıfırla
+        self.target_event.clear()
+        self.target_position = None
+        self.state = MissionState.RESUME_SEARCH
+
+        # AUTO'ya dön – ArduPlane kaldığı mission item'dan devam eder
+        print("[İHA] Aramaya devam ediliyor – AUTO mod...")
+        self._set_mode("AUTO")
+        self.state = MissionState.SEARCH
+
     # ── Mission yükleme ───────────────────────────────────────────────────────
 
     def _clear_mission(self):
@@ -253,6 +334,7 @@ class VTOLController:
 
     def _rtl(self):
         print("[İHA] RTL başlatılıyor...")
+        self.state = MissionState.RTL
         self._set_mode("RTL")
         self.mission_active = False
 
@@ -266,7 +348,7 @@ class VTOLController:
             return
 
         print(f"\n[İHA] Ev konumu: lat={home_lat:.7f}  lon={home_lon:.7f}")
-        print(f"[İHA] Waypoint'ler:")
+        print("[İHA] Waypoint'ler:")
         for i, (la, lo, al) in enumerate(WAYPOINTS):
             dist = haversine(home_lat, home_lon, la, lo)
             print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}  alt={al:.0f}m  ({dist:.0f}m uzakta)")
@@ -280,6 +362,7 @@ class VTOLController:
 
         self._set_current_item(1)
         self._set_mode("AUTO")
+        self.state = MissionState.SEARCH
 
         n        = len(WAYPOINTS)
         visited  = [None] * n
@@ -287,17 +370,32 @@ class VTOLController:
         deadline = time.time() + 600
 
         print(f"\n[İHA] Mission izleniyor ({n} waypoint)...")
+        print("[İHA] Manuel test: iha.on_target_detected(lat, lon, alt) çağır\n")
 
         while next_seq <= n and self.mission_active and time.time() < deadline:
+
+            # ── Hedef tespiti kontrolü ────────────────────────────────────────
+            if self.target_event.is_set():
+                self.state = MissionState.TARGET_DETECTED
+                self._handle_target()
+                # _handle_target() içinde AUTO'ya dönüldü, devam et
+                continue
+
+            # ── Mission item takibi (5s timeout – bu sürede event de kontrol) ─
             mreach = self.vehicle.recv_match(
                 type="MISSION_ITEM_REACHED", blocking=True, timeout=5)
+
+            # Tekrar event kontrol (recv_match bekleme süresinde gelmiş olabilir)
+            if self.target_event.is_set():
+                continue
 
             if mreach is None:
                 lat, lon, _ = self._get_position()
                 if lat is not None:
                     wp_lat, wp_lon, _ = WAYPOINTS[next_seq - 1]
                     dist = haversine(lat, lon, wp_lat, wp_lon)
-                    print(f"[İHA] WP{next_seq} bekleniyor – {dist:.0f} m", end="\r")
+                    print(f"[İHA] WP{next_seq} bekleniyor – {dist:.0f} m  "
+                          f"[durum: {self.state.name}]", end="\r")
                     if dist < WP_ARRIVAL_DIST:
                         mreach_seq = next_seq
                     else:
@@ -338,8 +436,10 @@ class VTOLController:
         print("\n" + "═" * 50)
         print("  VTOL İHA – OTONOM GÖREV")
         print("═" * 50)
-        print(f"  MAVLink : {VTOL_CONNECTION}")
-        print(f"  Kalkış  : {TAKEOFF_ALT} m  |  Hız: {CRUISE_SPEED} m/s")
+        print(f"  MAVLink  : {VTOL_CONNECTION}")
+        print(f"  Kalkış   : {TAKEOFF_ALT} m  |  Hız: {CRUISE_SPEED} m/s")
+        print(f"  Servo    : kanal {SERVO_CHANNEL}  "
+              f"aç={SERVO_OPEN_PWM}µs  kapa={SERVO_CLOSE_PWM}µs")
         print(f"  WP sayısı: {len(WAYPOINTS)}")
         for i, (la, lo, al) in enumerate(WAYPOINTS):
             print(f"    WP{i+1}: ({la}, {lo}, {al}m)")
@@ -368,4 +468,5 @@ class VTOLController:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    VTOLController().run()
+    iha = VTOLController()
+    iha.run()
