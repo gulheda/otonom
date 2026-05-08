@@ -1,91 +1,62 @@
 """
-VTOL İHA – Otonom Koordinat Gitme + İnsan Tespiti
-==================================================
-Araç    : alti_transition_quad  (ArduPlane VTOL)
-SysID   : 1  |  UDP : 14550
-
-Modlar:
-  WAYPOINT – Kalkış → 3 dinamik WP → koordinat yazdır → RTL
-  SCAN     – Kalkış → oval tarama → YOLOv8 insan tespiti
-             → GPS hesapla → drone'a UDP gönder → RTL
-
-Bağımlılıklar:
-    pip install pymavlink ultralytics opencv-python
-    (gz.transport13 Gazebo Harmonic ile gelir)
+VTOL İHA – 3 Waypoint Görevi + Hedef Tespiti
+==============================================
+Araç  : alti_transition_quad (ArduPlane VTOL)
+SysID : 1  |  UDP : 14550
+Görev : Kalkış → 3 WP → RTL
+        Uçuş sırasında on_target_detected() çağrılırsa:
+        → GUIDED/LOITER → Servo aç/kapa → AUTO devam
 """
-
-import os
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import time
 import math
 import threading
-import socket
-import json
-import cv2
-import numpy as np
+from enum import Enum, auto
 from pymavlink import mavutil
 
-# ── YOLOv8 ──────────────────────────────────────────────────────────────────
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("[UYARI] 'ultralytics' bulunamadı – YOLOv8 devre dışı.")
-
-# ── Gazebo Transport ─────────────────────────────────────────────────────────
-try:
-    from gz.transport13 import Node as GzNode
-    from gz.msgs10.image_pb2 import Image as GzImage
-    GZ_AVAILABLE = True
-except Exception as exc:
-    GZ_AVAILABLE = False
-    print(f"[UYARI] gz.transport13 yüklenemedi: {exc}")
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  AYARLAR
+#  AYARLAR – SADECE BURAYA DOKUNUN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Mod seçimi ────────────────────────────────────────────────────────────────
-MISSION_MODE = "WAYPOINT"   # "WAYPOINT" veya "SCAN"
-
-# ── Bağlantı ─────────────────────────────────────────────────────────────────
 VTOL_CONNECTION = "udp:127.0.0.1:14550"
 VTOL_SYSID      = 1
-DRONE_IP        = "127.0.0.1"
-DRONE_PORT      = 6000
 
-# ── Uçuş ─────────────────────────────────────────────────────────────────────
-TAKEOFF_ALT  = 30.0   # metre
-CRUISE_SPEED = 5.0    # m/s
-
-# ── WAYPOINT modu ─────────────────────────────────────────────────────────────
-WP_OFFSET_M     = 50.0   # metre – spawn'a göre WP uzaklığı
+TAKEOFF_ALT     = 30.0   # metre
+CRUISE_SPEED    = 5.0    # m/s
 WP_ALT          = 30.0   # metre
 WP_ARRIVAL_DIST = 10.0   # metre
 WP_HOVER_TIME   = 3.0    # saniye
 
-# ── SCAN modu ─────────────────────────────────────────────────────────────────
-SCAN_ALT        = 30.0   # metre – tarama irtifası
-SCAN_SPEED      = 5.0    # m/s
-SCAN_RADIUS_M   = 80.0   # metre – oval yarı eksen
-SCAN_POINTS     = 16     # oval üzerindeki WP sayısı
-SCAN_REPEAT     = 0      # 0 = tespit edilene kadar tekrar
+# ── Servo ─────────────────────────────────────────────────────────────────────
+SERVO_CHANNEL   = 8      # RC çıkış kanalı
+SERVO_OPEN_PWM  = 1900   # µs – yük bırakma
+SERVO_CLOSE_PWM = 1100   # µs – kilit
 
-# ── YOLOv8 ───────────────────────────────────────────────────────────────────
-YOLO_MODEL      = "yolov8n.pt"
-CONFIRM_FRAMES  = 5      # ardışık kaç frame'de tespit = onay
-CONFIRM_CONF    = 0.60   # minimum güven skoru
-
-# ── Kamera ───────────────────────────────────────────────────────────────────
-CAMERA_TOPIC    = "/camera/image"
-CAMERA_HFOV_DEG = 60.0
+# ── 3 Hedef Koordinat ────────────────────────────────────────────────────────
+WAYPOINTS = [
+    (-35.3628102, 149.1652074, WP_ALT),   # WP1
+    (-35.3632594, 149.1657582, WP_ALT),   # WP2
+    (-35.3637086, 149.1652074, WP_ALT),   # WP3
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  YARDIMCI FONKSİYONLAR
+#  DURUM MAKİNESİ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MissionState(Enum):
+    TAKEOFF         = auto()
+    SEARCH          = auto()
+    TARGET_DETECTED = auto()
+    HOLD            = auto()
+    DROP            = auto()
+    RESUME_SEARCH   = auto()
+    RTL             = auto()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  YARDIMCI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -93,135 +64,8 @@ def haversine(lat1, lon1, lat2, lon2):
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlam = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def pixel_to_gps(cx, cy, img_w, img_h, vtol_lat, vtol_lon, vtol_alt, yaw_deg):
-    """Piksel koordinatından GPS hesaplar (nadir kamera, sıfır pitch/roll)."""
-    hfov = math.radians(CAMERA_HFOV_DEG)
-    vfov = hfov * img_h / img_w
-    dx_m = vtol_alt * math.tan((cx / img_w - 0.5) * hfov)
-    dy_m = vtol_alt * math.tan((cy / img_h - 0.5) * vfov)
-    yaw  = math.radians(yaw_deg)
-    north =  dx_m * math.sin(yaw) - dy_m * math.cos(yaw)
-    east  =  dx_m * math.cos(yaw) + dy_m * math.sin(yaw)
-    dlat  = north / 111_320.0
-    dlon  = east  / (111_320.0 * math.cos(math.radians(vtol_lat)))
-    return vtol_lat + dlat, vtol_lon + dlon
-
-
-def generate_oval(center_lat, center_lon, radius_m, num_points, alt):
-    """Çember üzerinde eşit aralıklı waypoint listesi üretir."""
-    dlat = radius_m / 111_320.0
-    dlon = radius_m / (111_320.0 * math.cos(math.radians(center_lat)))
-    return [
-        (center_lat + math.sin(2 * math.pi * i / num_points) * dlat,
-         center_lon + math.cos(2 * math.pi * i / num_points) * dlon,
-         alt)
-        for i in range(num_points)
-    ]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  GAZEBO KAMERA
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class GazeboCamera:
-    def __init__(self, topic=CAMERA_TOPIC):
-        self.topic    = topic
-        self._frame   = None
-        self._lock    = threading.Lock()
-        self._count   = 0
-        self._node    = None
-        self._sub     = None
-
-    def start(self):
-        if not GZ_AVAILABLE:
-            print("[Kamera] gz.transport13 yok.")
-            return False
-        try:
-            self._node = GzNode()
-            self._sub  = self._node.subscribe(GzImage, self.topic, self._cb)
-            print(f"[Kamera] Abone olundu: {self.topic}")
-            threading.Thread(target=self._check_first, daemon=True).start()
-            return True
-        except Exception as exc:
-            print(f"[Kamera] Başlatma hatası: {exc}")
-            return False
-
-    def _check_first(self, timeout=8):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._count > 0:
-                print(f"[Kamera] İlk frame alındı.")
-                return
-            time.sleep(0.5)
-        print(f"[Kamera] UYARI: {timeout}s içinde frame gelmedi – "
-              f"Gazebo çalışıyor mu? Topic: {self.topic}")
-
-    def _cb(self, msg):
-        try:
-            w, h = msg.width, msg.height
-            data = np.frombuffer(msg.data, dtype=np.uint8)
-            if msg.pixel_format_type == 3:
-                frame = cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
-            else:
-                frame = data.reshape(h, w, 3)
-            with self._lock:
-                self._frame = frame.copy()
-                self._count += 1
-        except Exception:
-            pass
-
-    def get_frame(self):
-        with self._lock:
-            return self._frame.copy() if self._frame is not None else None
-
-    @property
-    def frame_count(self):
-        return self._count
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  YOLO TESPİT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class PersonDetector:
-    def __init__(self):
-        self._model = None
-        if not YOLO_AVAILABLE:
-            return
-        try:
-            self._model = YOLO(YOLO_MODEL)
-            print(f"[YOLO] Model yüklendi: {YOLO_MODEL}")
-        except Exception as exc:
-            print(f"[YOLO] Model yükleme hatası: {exc}")
-
-    def detect(self, frame):
-        """Person (class 0) tespiti. Sonuç: [{'conf', 'cx', 'cy', 'bbox'}]"""
-        if self._model is None or frame is None:
-            return []
-        found = []
-        try:
-            for r in self._model(frame, verbose=False):
-                if r.boxes is None:
-                    continue
-                for box in r.boxes:
-                    if int(box.cls[0]) != 0:
-                        continue
-                    conf = float(box.conf[0])
-                    if conf < CONFIRM_CONF:
-                        continue
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    found.append({"conf": conf,
-                                  "cx": (x1 + x2) // 2,
-                                  "cy": (y1 + y2) // 2,
-                                  "bbox": [x1, y1, x2, y2]})
-        except Exception as exc:
-            print(f"[YOLO] Çıkarım hatası: {exc}")
-        return found
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -233,14 +77,20 @@ class VTOLController:
     def __init__(self):
         self.vehicle        = None
         self.mission_active = True
-        self.camera         = GazeboCamera()
-        self.detector       = PersonDetector()
+        self.state          = MissionState.TAKEOFF
 
-        self._confirm_count = 0
-        self._target_found  = False
-        self._target_lock   = threading.Lock()
-        self._target_lat    = None
-        self._target_lon    = None
+        # Hedef tespiti için sinyal – dışarıdan on_target_detected() ile set edilir
+        self.target_event    = threading.Event()
+        self.target_position = None   # (lat, lon, alt)
+
+    # ── Dışarıdan çağrılacak tetik – ileride kamera kodu buraya bağlanır ─────
+
+    def on_target_detected(self, lat, lon, alt):
+        """Görüntü işleme (veya manuel test) hedef bulduğunda çağırır."""
+        self.target_position = (lat, lon, alt)
+        self.target_event.set()
+        print(f"\n[İHA] ★ Hedef tespit sinyali alındı: "
+              f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.1f}m")
 
     # ── Bağlantı ─────────────────────────────────────────────────────────────
 
@@ -290,25 +140,52 @@ class VTOLController:
                 if msg.get_srcSystem() != self.vehicle.target_system:
                     continue
                 if getattr(msg, "custom_mode", None) == mode_id:
-                    print(f"[İHA] Mod → {mode_name} (HEARTBEAT)")
+                    print(f"[İHA] Mod → {mode_name}")
                     return True
             elif msg.get_type() == "COMMAND_ACK":
+                cmd = getattr(msg, "command", None)
+                if cmd not in (mavutil.mavlink.MAV_CMD_DO_SET_MODE, None):
+                    continue
                 if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                    print(f"[İHA] Mod → {mode_name} (ACK)")
+                    print(f"[İHA] Mod → {mode_name}")
                     return True
-        hb = self.vehicle.recv_match(type="HEARTBEAT", blocking=True, timeout=3)
-        if (hb and hb.get_srcSystem() == self.vehicle.target_system
-                and getattr(hb, "custom_mode", None) == mode_id):
-            print(f"[İHA] Mod → {mode_name} (gecikmiş)")
-            return True
         print(f"[İHA] Mod onaylanamadı: {mode_name} – devam ediliyor.")
         return False
 
-    def _arm(self):
+    def _wait_prearm(self, timeout=30):
+        print("[İHA] Pre-arm bekleniyor...", end="", flush=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.vehicle.recv_match(type="SYS_STATUS", blocking=True, timeout=2)
+            if msg is None:
+                continue
+            hb = self.vehicle.recv_match(type="HEARTBEAT", blocking=False)
+            if hb and hb.get_srcSystem() == self.vehicle.target_system:
+                if not (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                    print(".", end="", flush=True)
+            time.sleep(0.5)
+        print()
+
+    def _arm(self, retries=10, retry_delay=3):
         print("[İHA] ARM ediliyor...")
-        self.vehicle.arducopter_arm()
-        self.vehicle.motors_armed_wait()
-        print("[İHA] ARM tamamlandı.")
+        for attempt in range(1, retries + 1):
+            self.vehicle.mav.command_long_send(
+                self.vehicle.target_system, self.vehicle.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 1, 0, 0, 0, 0, 0, 0)
+            ack = self.vehicle.recv_match(
+                type="COMMAND_ACK", blocking=True, timeout=3)
+            if ack and ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+                if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    self.vehicle.motors_armed_wait()
+                    print("[İHA] ARM tamamlandı.")
+                    return
+                print(f"[İHA] ARM reddedildi (result={ack.result}) – "
+                      f"{retry_delay}s sonra tekrar ({attempt}/{retries})")
+            else:
+                print(f"[İHA] ARM ACK gelmedi – {retry_delay}s sonra ({attempt}/{retries})")
+            time.sleep(retry_delay)
+        print("[İHA] ARM başarısız – devam ediliyor.")
 
     def _takeoff(self, altitude):
         print(f"[İHA] TAKEOFF → {altitude} m")
@@ -332,9 +209,8 @@ class VTOLController:
         msg = self.vehicle.recv_match(
             type="GLOBAL_POSITION_INT", blocking=True, timeout=5)
         if msg is None:
-            return None, None, None, None
-        return (msg.lat / 1e7, msg.lon / 1e7,
-                msg.relative_alt / 1000.0, msg.hdg / 100.0)
+            return None, None, None
+        return msg.lat / 1e7, msg.lon / 1e7, msg.relative_alt / 1000.0
 
     def _set_speed(self, speed_ms):
         self.vehicle.mav.command_long_send(
@@ -342,25 +218,52 @@ class VTOLController:
             mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
             0, 1, speed_ms, -1, 0, 0, 0, 0)
 
-    def _goto(self, lat, lon, alt):
-        """GUIDED modda hedefe git (ArduCopter + ArduPlane komutları birlikte)."""
-        self.vehicle.mav.set_position_target_global_int_send(
-            0, self.vehicle.target_system, self.vehicle.target_component,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-            0b0000_1111_1111_1000,
-            int(lat * 1e7), int(lon * 1e7), alt,
-            0, 0, 0, 0, 0, 0, 0, 0)
-        self.vehicle.mav.command_int_send(
-            self.vehicle.target_system, self.vehicle.target_component,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            mavutil.mavlink.MAV_CMD_DO_REPOSITION,
-            0, 0, -1, 0, 0, float("nan"),
-            int(lat * 1e7), int(lon * 1e7), alt)
+    # ── Servo ─────────────────────────────────────────────────────────────────
 
-    def _hover(self):
-        lat, lon, alt, _ = self._get_position()
-        if lat is not None:
-            self._goto(lat, lon, alt)
+    def _set_servo_pwm(self, channel, pwm):
+        self.vehicle.mav.command_long_send(
+            self.vehicle.target_system, self.vehicle.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0, channel, pwm, 0, 0, 0, 0, 0)
+
+    def _drop_payload(self):
+        """Servo aç → bekle → kapat."""
+        self.state = MissionState.DROP
+        print(f"[İHA] Servo açılıyor  – kanal {SERVO_CHANNEL}, {SERVO_OPEN_PWM} µs")
+        self._set_servo_pwm(SERVO_CHANNEL, SERVO_OPEN_PWM)
+        time.sleep(1.5)
+        print(f"[İHA] Servo kapanıyor – kanal {SERVO_CHANNEL}, {SERVO_CLOSE_PWM} µs")
+        self._set_servo_pwm(SERVO_CHANNEL, SERVO_CLOSE_PWM)
+        print("[İHA] Servo tamamlandı.")
+
+    # ── Hedef işleme ──────────────────────────────────────────────────────────
+
+    def _handle_target(self):
+        """
+        target_event set olduğunda çağrılır.
+        AUTO → GUIDED/LOITER dur → servo → AUTO devam
+        """
+        self.state = MissionState.HOLD
+        lat, lon, alt = self.target_position or (None, None, None)
+        print(f"[İHA] Hedef işleniyor – duruluyor...")
+
+        # Durdur: önce GUIDED dene, olmazsa LOITER
+        if not self._set_mode("GUIDED"):
+            self._set_mode("LOITER")
+        time.sleep(2)
+
+        # Servo
+        self._drop_payload()
+
+        # Event'i temizle, konumu sıfırla
+        self.target_event.clear()
+        self.target_position = None
+        self.state = MissionState.RESUME_SEARCH
+
+        # AUTO'ya dön – ArduPlane kaldığı mission item'dan devam eder
+        print("[İHA] Aramaya devam ediliyor – AUTO mod...")
+        self._set_mode("AUTO")
+        self.state = MissionState.SEARCH
 
     # ── Mission yükleme ───────────────────────────────────────────────────────
 
@@ -379,12 +282,12 @@ class VTOLController:
                   int(home_lat * 1e7), int(home_lon * 1e7), float(home_alt))]
         for i, (lat, lon, alt) in enumerate(waypoints):
             items.append((i + 1, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                           mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                           0, 1, 0.0, float(WP_ARRIVAL_DIST), 0.0, float("nan"),
-                           int(lat * 1e7), int(lon * 1e7), float(alt)))
+                          mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                          0, 1, 0.0, float(WP_ARRIVAL_DIST), 0.0, float("nan"),
+                          int(lat * 1e7), int(lon * 1e7), float(alt)))
         items.append((len(waypoints) + 1, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                       mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
-                       0, 1, 0.0, 0.0, 0.0, 0.0, 0, 0, 0.0))
+                      mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                      0, 1, 0.0, 0.0, 0.0, 0.0, 0, 0, 0.0))
 
         total = len(items)
         print(f"[İHA] Mission yükleniyor ({total} item)...")
@@ -423,7 +326,7 @@ class VTOLController:
             msg = self.vehicle.recv_match(
                 type="MISSION_CURRENT", blocking=True, timeout=3)
             if msg and msg.seq == seq:
-                print(f"[İHA] Mission başlangıç item: {msg.seq}")
+                print(f"[İHA] Mission başlangıç: item {msg.seq}")
                 return True
             time.sleep(0.5)
         print(f"[İHA] Mission current {seq} onaylanamadı – devam ediliyor.")
@@ -431,182 +334,72 @@ class VTOLController:
 
     def _rtl(self):
         print("[İHA] RTL başlatılıyor...")
+        self.state = MissionState.RTL
         self._set_mode("RTL")
         self.mission_active = False
 
-    # ── Drone'a koordinat gönder ──────────────────────────────────────────────
+    # ── Ana görev ─────────────────────────────────────────────────────────────
 
-    def _send_to_drone(self, lat, lon, alt=25.0):
-        print("\n" + "═" * 52)
-        print("  [İHA] HEDEF TESPİT EDİLDİ")
-        print(f"  latitude  : {lat:.7f}")
-        print(f"  longitude : {lon:.7f}")
-        print(f"  altitude  : {alt:.1f} m")
-        print("═" * 52)
-        payload = json.dumps({"cmd": "GOTO", "lat": lat, "lon": lon, "alt": alt})
-        for attempt in range(3):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.sendto(payload.encode(), (DRONE_IP, DRONE_PORT))
-                s.close()
-                print(f"[İHA→Drone] Koordinat gönderildi ({DRONE_IP}:{DRONE_PORT})")
-                return
-            except Exception as exc:
-                print(f"[İHA→Drone] Hata ({attempt+1}/3): {exc}")
-                time.sleep(1)
-
-    # ── Vision thread ─────────────────────────────────────────────────────────
-
-    def _vision_loop(self):
-        print("[Görüntü] YOLOv8 döngüsü başladı.")
-        prev_count = 0
-        warn_ts    = time.time()
-
-        while self.mission_active and not self._target_found:
-            if self.camera.frame_count == prev_count:
-                if time.time() - warn_ts >= 10:
-                    print(f"[Görüntü] Frame bekleniyor "
-                          f"(sayaç={self.camera.frame_count})...")
-                    warn_ts = time.time()
-                time.sleep(0.05)
-                continue
-            warn_ts = time.time()
-
-            frame = self.camera.get_frame()
-            prev_count = self.camera.frame_count
-            if frame is None:
-                continue
-
-            detections = self.detector.detect(frame)
-            if not detections:
-                self._confirm_count = 0
-                continue
-
-            best = max(detections, key=lambda d: d["conf"])
-            self._confirm_count += 1
-            print(f"[Görüntü] Tespit {self._confirm_count}/{CONFIRM_FRAMES}  "
-                  f"conf={best['conf']:.2f}  piksel=({best['cx']},{best['cy']})",
-                  end="\r")
-
-            if self._confirm_count >= CONFIRM_FRAMES:
-                lat, lon, alt, yaw = self._get_position()
-                if lat is None:
-                    self._confirm_count = 0
-                    continue
-                h, w = frame.shape[:2]
-                tgt_lat, tgt_lon = pixel_to_gps(
-                    best["cx"], best["cy"], w, h, lat, lon, alt, yaw)
-                print(f"\n[Görüntü] {CONFIRM_FRAMES} frame onaylandı! "
-                      f"Hedef=({tgt_lat:.6f},{tgt_lon:.6f})")
-                with self._target_lock:
-                    self._target_lat   = tgt_lat
-                    self._target_lon   = tgt_lon
-                    self._target_found = True
-                self._confirm_count = 0
-
-            time.sleep(0.05)
-        print("[Görüntü] Döngü sonlandı.")
-
-    # ── SCAN görev döngüsü ────────────────────────────────────────────────────
-
-    def _scan_loop(self):
-        """Oval tarama: her turda yeniden mission yükle, vision thread paralel."""
-        home_lat, home_lon, home_alt, _ = self._get_position()
-        if home_lat is None:
-            print("[İHA] GPS alınamadı!")
-            return
-
-        waypoints = generate_oval(
-            home_lat, home_lon, SCAN_RADIUS_M, SCAN_POINTS, SCAN_ALT)
-
-        print(f"[İHA] Oval tarama – {SCAN_POINTS} WP, yarıçap={SCAN_RADIUS_M}m")
-
-        tur = 0
-        while self.mission_active and not self._target_found:
-            tur += 1
-            if SCAN_REPEAT > 0 and tur > SCAN_REPEAT:
-                print(f"[İHA] {SCAN_REPEAT} tur tamamlandı – tespit yok.")
-                break
-
-            print(f"\n[İHA] ── TUR {tur} ──")
-            self._set_mode("GUIDED")
-            self._set_speed(SCAN_SPEED)
-
-            for wp_lat, wp_lon, wp_alt in waypoints:
-                if not self.mission_active or self._target_found:
-                    break
-                self._goto(wp_lat, wp_lon, wp_alt)
-
-                while self.mission_active and not self._target_found:
-                    lat, lon, _, _ = self._get_position()
-                    if lat is None:
-                        time.sleep(0.3)
-                        continue
-                    if haversine(lat, lon, wp_lat, wp_lon) < WP_ARRIVAL_DIST:
-                        break
-                    self._goto(wp_lat, wp_lon, wp_alt)  # ArduPlane: periyodik yenile
-                    time.sleep(1.0)
-
-        if self._target_found:
-            print("\n[İHA] Hedef onaylandı – hover yapılıyor...")
-            self._set_mode("GUIDED")
-            self._hover()
-            time.sleep(3)
-            with self._target_lock:
-                tgt_lat, tgt_lon = self._target_lat, self._target_lon
-            self._send_to_drone(tgt_lat, tgt_lon)
-            time.sleep(5)
-
-        self._rtl()
-
-    # ── WAYPOINT görev döngüsü ────────────────────────────────────────────────
-
-    def _waypoint_mission(self):
+    def _run_mission(self):
         self._set_speed(CRUISE_SPEED)
-        home_lat, home_lon, home_alt, _ = self._get_position()
+        home_lat, home_lon, home_alt = self._get_position()
         if home_lat is None:
             print("[İHA] GPS alınamadı!")
             return
 
         print(f"\n[İHA] Ev konumu: lat={home_lat:.7f}  lon={home_lon:.7f}")
-        d    = WP_OFFSET_M
-        dlat = d / 111_320.0
-        dlon = d / (111_320.0 * math.cos(math.radians(home_lat)))
-        waypoints = [
-            (home_lat + dlat, home_lon,        WP_ALT),
-            (home_lat,        home_lon + dlon, WP_ALT),
-            (home_lat - dlat, home_lon,        WP_ALT),
-        ]
-        print(f"[İHA] Waypoint'ler ({d}m offset):")
-        for i, (la, lo, al) in enumerate(waypoints):
-            print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}  alt={al:.0f}m")
+        print("[İHA] Waypoint'ler:")
+        for i, (la, lo, al) in enumerate(WAYPOINTS):
+            dist = haversine(home_lat, home_lon, la, lo)
+            print(f"  WP{i+1}: lat={la:.7f}  lon={lo:.7f}  alt={al:.0f}m  ({dist:.0f}m uzakta)")
 
         self._clear_mission()
         time.sleep(0.5)
-        if not self._upload_mission(home_lat, home_lon, home_alt, waypoints):
+        if not self._upload_mission(home_lat, home_lon, home_alt, WAYPOINTS):
             print("[İHA] Mission yüklenemedi!")
             self._rtl()
             return
 
         self._set_current_item(1)
         self._set_mode("AUTO")
+        self.state = MissionState.SEARCH
 
-        n, visited, next_seq = len(waypoints), [None] * len(waypoints), 1
-        print(f"\n[İHA] Mission izleniyor ({n} waypoint)...")
+        n        = len(WAYPOINTS)
+        visited  = [None] * n
+        next_seq = 1
         deadline = time.time() + 600
 
+        print(f"\n[İHA] Mission izleniyor ({n} waypoint)...")
+        print("[İHA] Manuel test: iha.on_target_detected(lat, lon, alt) çağır\n")
+
         while next_seq <= n and self.mission_active and time.time() < deadline:
+
+            # ── Hedef tespiti kontrolü ────────────────────────────────────────
+            if self.target_event.is_set():
+                self.state = MissionState.TARGET_DETECTED
+                self._handle_target()
+                # _handle_target() içinde AUTO'ya dönüldü, devam et
+                continue
+
+            # ── Mission item takibi (5s timeout – bu sürede event de kontrol) ─
             mreach = self.vehicle.recv_match(
                 type="MISSION_ITEM_REACHED", blocking=True, timeout=5)
+
+            # Tekrar event kontrol (recv_match bekleme süresinde gelmiş olabilir)
+            if self.target_event.is_set():
+                continue
+
             if mreach is None:
-                lat, lon, _, _ = self._get_position()
+                lat, lon, _ = self._get_position()
                 if lat is not None:
-                    wp_lat, wp_lon, _ = waypoints[next_seq - 1]
+                    wp_lat, wp_lon, _ = WAYPOINTS[next_seq - 1]
                     dist = haversine(lat, lon, wp_lat, wp_lon)
-                    print(f"[İHA] WP{next_seq} bekleniyor – {dist:.1f} m", end="\r")
-                    if dist >= WP_ARRIVAL_DIST:
+                    print(f"[İHA] WP{next_seq} bekleniyor – {dist:.0f} m  "
+                          f"[durum: {self.state.name}]", end="\r")
+                    if dist < WP_ARRIVAL_DIST:
+                        mreach_seq = next_seq
+                    else:
                         continue
-                    mreach_seq = next_seq
                 else:
                     continue
             else:
@@ -614,62 +407,57 @@ class VTOLController:
 
             while next_seq <= mreach_seq and next_seq <= n:
                 idx = next_seq - 1
-                wp_lat, wp_lon, wp_alt = waypoints[idx]
-                cur_lat, cur_lon, cur_alt, _ = self._get_position()
+                wp_lat, wp_lon, wp_alt = WAYPOINTS[idx]
+                cur_lat, cur_lon, cur_alt = self._get_position()
                 if cur_lat is None:
                     cur_lat, cur_lon, cur_alt = wp_lat, wp_lon, wp_alt
                 visited[idx] = (cur_lat, cur_lon, cur_alt)
-                print(f"\n{'─' * 52}")
+                print(f"\n{'─' * 50}")
                 print(f"  [İHA] WAYPOINT {next_seq} ULAŞILDI")
                 print(f"  latitude  : {cur_lat:.7f}")
                 print(f"  longitude : {cur_lon:.7f}")
                 print(f"  altitude  : {cur_alt:.1f} m")
-                print(f"{'─' * 52}")
+                print(f"{'─' * 50}")
                 time.sleep(WP_HOVER_TIME)
                 next_seq += 1
 
-        print("\n" + "═" * 52)
+        print("\n" + "═" * 50)
         print("  [İHA] TÜM WAYPOINT'LER TAMAMLANDI")
-        print("═" * 52)
+        print("═" * 50)
         for i, v in enumerate(visited):
             if v:
                 print(f"  WP{i+1}: lat={v[0]:.7f}  lon={v[1]:.7f}  alt={v[2]:.1f}m")
-        print("═" * 52)
+        print("═" * 50)
         self._rtl()
 
     # ── Giriş noktası ─────────────────────────────────────────────────────────
 
     def run(self):
-        print("\n" + "═" * 52)
-        print("  VTOL İHA – OTONOM GÖREV SİSTEMİ")
-        print("═" * 52)
-        print(f"  Mod        : {MISSION_MODE}")
-        print(f"  MAVLink    : {VTOL_CONNECTION}")
-        print(f"  Kalkış     : {TAKEOFF_ALT} m  |  Hız: {CRUISE_SPEED} m/s")
-        if MISSION_MODE == "SCAN":
-            print(f"  Kamera     : {CAMERA_TOPIC}")
-            print(f"  YOLO       : {YOLO_MODEL}  |  Eşik: {CONFIRM_CONF}")
-            print(f"  Oval       : r={SCAN_RADIUS_M}m, {SCAN_POINTS} WP")
-        print("═" * 52 + "\n")
+        print("\n" + "═" * 50)
+        print("  VTOL İHA – OTONOM GÖREV")
+        print("═" * 50)
+        print(f"  MAVLink  : {VTOL_CONNECTION}")
+        print(f"  Kalkış   : {TAKEOFF_ALT} m  |  Hız: {CRUISE_SPEED} m/s")
+        print(f"  Servo    : kanal {SERVO_CHANNEL}  "
+              f"aç={SERVO_OPEN_PWM}µs  kapa={SERVO_CLOSE_PWM}µs")
+        print(f"  WP sayısı: {len(WAYPOINTS)}")
+        for i, (la, lo, al) in enumerate(WAYPOINTS):
+            print(f"    WP{i+1}: ({la}, {lo}, {al}m)")
+        print("═" * 50 + "\n")
 
         if not self.connect():
             print("[İHA] Bağlantı kurulamadı.")
             return
 
-        if MISSION_MODE == "SCAN":
-            self.camera.start()
-            threading.Thread(target=self._vision_loop, daemon=True).start()
-
-        self._set_mode("GUIDED")
+        if not self._set_mode("GUIDED"):
+            self._set_mode("QSTABILIZE")
         time.sleep(1)
+        self._wait_prearm(timeout=30)
         self._arm()
         self._takeoff(TAKEOFF_ALT)
 
         try:
-            if MISSION_MODE == "SCAN":
-                self._scan_loop()
-            else:
-                self._waypoint_mission()
+            self._run_mission()
         except KeyboardInterrupt:
             print("\n[İHA] Kullanıcı tarafından durduruldu.")
             self._rtl()
@@ -680,4 +468,5 @@ class VTOLController:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    VTOLController().run()
+    iha = VTOLController()
+    iha.run()
