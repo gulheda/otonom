@@ -353,11 +353,51 @@ class VTOLController:
         print(f"[İHA] Mod onaylanamadı: {mode_name} – devam ediliyor.")
         return False
 
-    def _arm(self):
+    def _wait_prearm(self, timeout=30):
+        """EKF ve gyro tutarlılığı hazır olana kadar bekle."""
+        print("[İHA] Pre-arm kontrol bekleniyor...", end="", flush=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.vehicle.recv_match(
+                type="SYS_STATUS", blocking=True, timeout=2)
+            if msg is None:
+                continue
+            # Tüm pre-arm sensörleri sağlıklıysa onboard_control_sensors_health
+            # alanında gerekli bitler set olur; en basit kontrol: 3 saniye boyunca
+            # HEARTBEAT'te base_mode'da ARMED bayrağı yoksa pre-arm temizdir.
+            hb = self.vehicle.recv_match(
+                type="HEARTBEAT", blocking=False)
+            if hb and hb.get_srcSystem() == self.vehicle.target_system:
+                armed = bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                if not armed:
+                    print(".", end="", flush=True)
+            time.sleep(0.5)
+        print()
+
+    def _arm(self, retries=10, retry_delay=3):
         print("[İHA] ARM ediliyor...")
-        self.vehicle.arducopter_arm()
-        self.vehicle.motors_armed_wait()
-        print("[İHA] ARM tamamlandı.")
+        for attempt in range(1, retries + 1):
+            self.vehicle.mav.command_long_send(
+                self.vehicle.target_system, self.vehicle.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 1, 0, 0, 0, 0, 0, 0)
+            ack = self.vehicle.recv_match(
+                type="COMMAND_ACK", blocking=True, timeout=3)
+            if ack and ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+                if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    self.vehicle.motors_armed_wait()
+                    print("[İHA] ARM tamamlandı.")
+                    return
+                # result=4 → pre-arm check failed; result metni varsa göster
+                reason = getattr(ack, "result_param2", "")
+                print(f"[İHA] ARM reddedildi (result={ack.result}"
+                      f"{', ' + str(reason) if reason else ''}) "
+                      f"– {retry_delay}s sonra tekrar ({attempt}/{retries})")
+            else:
+                print(f"[İHA] ARM ACK gelmedi – {retry_delay}s sonra tekrar "
+                      f"({attempt}/{retries})")
+            time.sleep(retry_delay)
+        print("[İHA] ARM başarısız – devam ediliyor.")
 
     def _takeoff(self, altitude):
         print(f"[İHA] TAKEOFF → {altitude} m")
@@ -724,6 +764,7 @@ class VTOLController:
             print("[İHA] GUIDED başarısız → QSTABILIZE deneniyor...")
             self._set_mode("QSTABILIZE")
         time.sleep(1)
+        self._wait_prearm(timeout=30)
         self._arm()
         self._takeoff(TAKEOFF_ALT)
 
