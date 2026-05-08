@@ -151,7 +151,7 @@ class GazeboCamera:
             print(f"[Kamera] Başlatma hatası: {exc}")
             return False
 
-    def _check_first(self, timeout=8):
+    def _check_first(self, timeout=15):
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self._count > 0:
@@ -159,21 +159,62 @@ class GazeboCamera:
                 return
             time.sleep(0.5)
         print(f"[Kamera] UYARI: {timeout}s içinde frame gelmedi – "
-              f"Gazebo çalışıyor mu? Topic: {self.topic}")
+              f"Gazebo çalışıyor mu? Beklenen topic: {self.topic}")
+        # Mevcut Gazebo topic'lerini listele
+        try:
+            topics = self._node.topic_list() if self._node else []
+            img_topics = [t for t in topics if "image" in t.lower() or "camera" in t.lower()]
+            if img_topics:
+                print(f"[Kamera] Gazebo'daki kamera topic'leri:")
+                for t in img_topics:
+                    print(f"  {t}")
+                print(f"[Kamera] İPUCU: CAMERA_TOPIC değişkenini yukarıdaki "
+                      f"topic'lerden biriyle güncelleyin.")
+            elif topics:
+                print(f"[Kamera] Gazebo topic listesinde kamera bulunamadı. "
+                      f"Toplam {len(topics)} topic var.")
+            else:
+                print(f"[Kamera] Gazebo topic listesi boş – simülasyon çalışıyor mu?")
+        except Exception as exc:
+            print(f"[Kamera] Topic listesi alınamadı: {exc}")
 
     def _cb(self, msg):
         try:
             w, h = msg.width, msg.height
+            fmt = getattr(msg, "pixel_format_type", 3)
             data = np.frombuffer(msg.data, dtype=np.uint8)
-            if msg.pixel_format_type == 3:
+            data_len = len(msg.data)
+
+            # Gazebo piksel format sabitleri (gz-msgs)
+            if fmt == 3:    # PIXEL_FORMAT_RGB_INT8
+                frame = cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+            elif fmt == 4:  # PIXEL_FORMAT_RGBA_INT8
+                frame = cv2.cvtColor(data.reshape(h, w, 4), cv2.COLOR_RGBA2BGR)
+            elif fmt == 5:  # PIXEL_FORMAT_BGRA_INT8
+                frame = cv2.cvtColor(data.reshape(h, w, 4), cv2.COLOR_BGRA2BGR)
+            elif fmt == 7:  # PIXEL_FORMAT_BGR_INT8
+                frame = data.reshape(h, w, 3)
+            elif data_len == w * h * 4:
+                frame = cv2.cvtColor(data.reshape(h, w, 4), cv2.COLOR_BGRA2BGR)
+            elif data_len == w * h * 3:
                 frame = cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
             else:
-                frame = data.reshape(h, w, 3)
+                if self._count == 0:
+                    print(f"[Kamera] Desteklenmeyen format: type={fmt}, "
+                          f"boyut={data_len}B beklenen={w*h*3}B ({w}x{h})")
+                return
+
             with self._lock:
                 self._frame = frame.copy()
                 self._count += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            if self._count == 0:
+                fmt_val = getattr(msg, "pixel_format_type", "?")
+                w_val   = getattr(msg, "width", "?")
+                h_val   = getattr(msg, "height", "?")
+                d_len   = len(getattr(msg, "data", b""))
+                print(f"[Kamera] Frame işleme hatası: {exc} "
+                      f"(fmt={fmt_val}, {w_val}x{h_val}, {d_len}B)")
 
     def get_frame(self):
         with self._lock:
@@ -293,9 +334,17 @@ class VTOLController:
                     print(f"[İHA] Mod → {mode_name} (HEARTBEAT)")
                     return True
             elif msg.get_type() == "COMMAND_ACK":
+                # Sadece mod değiştirme ACK'ini kabul et – diğer komutların
+                # ACK'i yanlış "başarılı" sonuç verebilir.
+                cmd = getattr(msg, "command", None)
+                if cmd not in (mavutil.mavlink.MAV_CMD_DO_SET_MODE, None):
+                    continue
                 if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
                     print(f"[İHA] Mod → {mode_name} (ACK)")
                     return True
+                if msg.result not in (mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
+                                      mavutil.mavlink.MAV_RESULT_TEMPORARILY_REJECTED):
+                    print(f"[İHA] Mod reddedildi (result={msg.result}): {mode_name}")
         hb = self.vehicle.recv_match(type="HEARTBEAT", blocking=True, timeout=3)
         if (hb and hb.get_srcSystem() == self.vehicle.target_system
                 and getattr(hb, "custom_mode", None) == mode_id):
@@ -429,6 +478,16 @@ class VTOLController:
         print(f"[İHA] Mission current {seq} onaylanamadı – devam ediliyor.")
         return False
 
+    def _set_nav_mode(self):
+        """GUIDED dene; VTOL desteklemiyorsa QLOITER'a geç."""
+        if self._set_mode("GUIDED"):
+            return "GUIDED"
+        print("[İHA] GUIDED başarısız → QLOITER deneniyor...")
+        if self._set_mode("QLOITER"):
+            return "QLOITER"
+        print("[İHA] UYARI: GUIDED/QLOITER onaylanamadı – mevcut modda devam.")
+        return None
+
     def _rtl(self):
         print("[İHA] RTL başlatılıyor...")
         self._set_mode("RTL")
@@ -529,7 +588,7 @@ class VTOLController:
                 break
 
             print(f"\n[İHA] ── TUR {tur} ──")
-            self._set_mode("GUIDED")
+            self._set_nav_mode()
             self._set_speed(SCAN_SPEED)
 
             for wp_lat, wp_lon, wp_alt in waypoints:
@@ -549,7 +608,7 @@ class VTOLController:
 
         if self._target_found:
             print("\n[İHA] Hedef onaylandı – hover yapılıyor...")
-            self._set_mode("GUIDED")
+            self._set_nav_mode()
             self._hover()
             time.sleep(3)
             with self._target_lock:
@@ -660,7 +719,10 @@ class VTOLController:
             self.camera.start()
             threading.Thread(target=self._vision_loop, daemon=True).start()
 
-        self._set_mode("GUIDED")
+        # ARM öncesi: GUIDED dene, olmuyorsa VTOL quad kalkış için QSTABILIZE
+        if not self._set_mode("GUIDED"):
+            print("[İHA] GUIDED başarısız → QSTABILIZE deneniyor...")
+            self._set_mode("QSTABILIZE")
         time.sleep(1)
         self._arm()
         self._takeoff(TAKEOFF_ALT)
