@@ -640,86 +640,115 @@ class VTOLController:
 
     # ── SCAN görev döngüsü ────────────────────────────────────────────────────
 
+    def _handle_detection(self, tgt_lat, tgt_lon):
+        """Tespit işleme: hover → servo → koordinat gönder."""
+        print(f"\n[İHA] ★ TESPİT İŞLENİYOR → ({tgt_lat:.6f}, {tgt_lon:.6f})")
+
+        # AUTO'dan LOITER/QLOITER'a geç – yerinde dur
+        if not self._set_mode("QLOITER"):
+            self._set_mode("LOITER")
+        self._hover()
+        time.sleep(2)
+
+        # İHA servo: drone'u serbest bırak
+        self._release_drone()
+
+        # Koordinatı drone'a / yer istasyonuna ilet
+        self._send_to_drone(tgt_lat, tgt_lon)
+
+        # Drone stabilize olsun
+        print("[İHA] Drone stabilize bekleniyor (5s)...")
+        time.sleep(5)
+
     def _scan_loop(self):
         """
-        Tam görev akışı:
-        Kalkış sonrası → oval tarama (SCAN_LAPS tur)
-        Her WP'ye giderken tespit kuyruğu kontrol edilir.
-        Tespit varsa: hover → servo (drone bırak) → koordinat gönder → taramaya devam.
-        Tüm turlar bitti → RTL.
+        Tam görev akışı – AUTO + mission upload (WAYPOINT modu gibi):
+        Oval WP'ler SCAN_LAPS tur için yüklenir → AUTO mod → ArduPlane uçar.
+        MISSION_ITEM_REACHED alındığında WP sayacı artar.
+        Paralel vision thread tespiti kuyruğa ekler; tespit kuyruğu boş değilse
+        AUTO duraklatılır (QLOITER/LOITER), tespit işlenir, AUTO devam eder.
+        Tüm WP'ler bitti → RTL.
         """
         home_lat, home_lon, home_alt, _ = self._get_position()
         if home_lat is None:
             print("[İHA] GPS alınamadı!")
             return
 
-        waypoints = generate_oval(
-            home_lat, home_lon, SCAN_RADIUS_M, SCAN_POINTS, SCAN_ALT)
+        # SCAN_LAPS tur = SCAN_LAPS × SCAN_POINTS waypoint
+        laps = SCAN_LAPS if SCAN_LAPS > 0 else 1
+        oval = generate_oval(home_lat, home_lon, SCAN_RADIUS_M, SCAN_POINTS, SCAN_ALT)
+        waypoints = oval * laps
+        total = len(waypoints)
 
-        lap_str = str(SCAN_LAPS) if SCAN_LAPS > 0 else "∞"
-        print(f"[İHA] Oval tarama başlıyor – "
-              f"{SCAN_POINTS} WP, yarıçap={SCAN_RADIUS_M}m, {lap_str} tur")
+        print(f"[İHA] Alan taraması yükleniyor – "
+              f"{SCAN_POINTS} WP × {laps} tur = {total} item")
 
-        tur = 0
-        while self.mission_active:
-            tur += 1
-            if SCAN_LAPS > 0 and tur > SCAN_LAPS:
-                print(f"[İHA] {SCAN_LAPS} tur tamamlandı – RTL.")
-                break
+        self._clear_mission()
+        time.sleep(0.5)
+        if not self._upload_mission(home_lat, home_lon, home_alt, waypoints):
+            print("[İHA] Mission yüklenemedi!")
+            self._rtl()
+            return
 
-            print(f"\n[İHA] ── TUR {tur}/{lap_str} ──")
-            self._set_nav_mode()
-            self._set_speed(SCAN_SPEED)
+        self._set_current_item(1)
+        self._set_mode("AUTO")
+        self._set_speed(SCAN_SPEED)
 
-            for wp_lat, wp_lon, wp_alt in waypoints:
-                if not self.mission_active:
-                    break
+        completed = 0        # kaç WP geçildi
+        next_seq  = 1        # beklenen mission seq (1-based)
+        deadline  = time.time() + 7200  # max 2 saat
 
-                self._goto(wp_lat, wp_lon, wp_alt)
+        print(f"[İHA] Alan taraması başladı ({total} WP izleniyor)...\n")
 
-                # WP'ye ulaşana kadar hem mesafe hem tespit kuyruğu kontrol
-                while self.mission_active:
-                    # Tespit var mı?
-                    detection = None
-                    with self._detect_lock:
-                        if self._detect_queue:
-                            detection = self._detect_queue.pop(0)
+        while completed < total and self.mission_active and time.time() < deadline:
 
-                    if detection:
-                        tgt_lat, tgt_lon = detection
-                        print(f"\n[İHA] ★ TESPİT İŞLENİYOR "
-                              f"→ ({tgt_lat:.6f}, {tgt_lon:.6f})")
+            # Tespit kuyruğu kontrol (non-blocking)
+            detection = None
+            with self._detect_lock:
+                if self._detect_queue:
+                    detection = self._detect_queue.pop(0)
 
-                        # Hover yap
-                        self._set_nav_mode()
-                        self._hover()
-                        time.sleep(2)
+            if detection:
+                tgt_lat, tgt_lon = detection
+                self._handle_detection(tgt_lat, tgt_lon)
+                # AUTO'ya geri dön – ArduPlane kaldığı mission item'dan devam eder
+                self._set_mode("AUTO")
+                self._set_speed(SCAN_SPEED)
 
-                        # Servo: drone'u serbest bırak
-                        self._release_drone()
+            # MISSION_ITEM_REACHED veya MISSION_CURRENT mesajı bekle (2s timeout)
+            msg = self.vehicle.recv_match(
+                type=["MISSION_ITEM_REACHED", "MISSION_CURRENT"],
+                blocking=True, timeout=2)
 
-                        # Koordinatı drone'a / yer istasyonuna ilet
-                        self._send_to_drone(tgt_lat, tgt_lon)
+            if msg is None:
+                # Pozisyon tabanlı ilerleme kontrolü (fallback)
+                lat, lon, _, _ = self._get_position()
+                if lat is not None and next_seq <= total:
+                    wp_lat, wp_lon, _ = waypoints[next_seq - 1]
+                    dist = haversine(lat, lon, wp_lat, wp_lon)
+                    print(f"[İHA] WP{next_seq}/{total} → {dist:.0f}m", end="\r")
+                    if dist < WP_ARRIVAL_DIST:
+                        completed += 1
+                        tur_no = (completed - 1) // SCAN_POINTS + 1
+                        wp_no  = (completed - 1) % SCAN_POINTS + 1
+                        print(f"\n[İHA] WP {completed}/{total} geçildi "
+                              f"(Tur {tur_no}, Nokta {wp_no})")
+                        next_seq += 1
+                continue
 
-                        # Drone stabilize olsun, sonra taramaya devam
-                        print("[İHA] Drone stabilize bekleniyor (5s)...")
-                        time.sleep(5)
+            if msg.get_type() == "MISSION_ITEM_REACHED":
+                seq = msg.seq
+                if seq >= next_seq:
+                    # Atlanmış WP'leri de say
+                    while next_seq <= seq and next_seq <= total:
+                        completed += 1
+                        tur_no = (completed - 1) // SCAN_POINTS + 1
+                        wp_no  = (completed - 1) % SCAN_POINTS + 1
+                        print(f"[İHA] WP {completed}/{total} geçildi "
+                              f"(Tur {tur_no}, Nokta {wp_no})")
+                        next_seq += 1
 
-                        # Mevcut WP'ye taramayı sürdür
-                        self._set_nav_mode()
-                        self._set_speed(SCAN_SPEED)
-                        self._goto(wp_lat, wp_lon, wp_alt)
-
-                    # WP mesafe kontrolü
-                    lat, lon, _, _ = self._get_position()
-                    if lat is None:
-                        time.sleep(0.3)
-                        continue
-                    if haversine(lat, lon, wp_lat, wp_lon) < WP_ARRIVAL_DIST:
-                        break
-                    self._goto(wp_lat, wp_lon, wp_alt)  # ArduPlane: periyodik yenile
-                    time.sleep(1.0)
-
+        print(f"\n[İHA] Tarama tamamlandı – {completed}/{total} WP geçildi.")
         self._rtl()
 
     # ── WAYPOINT görev döngüsü ────────────────────────────────────────────────
