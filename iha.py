@@ -49,7 +49,7 @@ except Exception as exc:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Mod seçimi ────────────────────────────────────────────────────────────────
-MISSION_MODE = "WAYPOINT"   # "WAYPOINT" veya "SCAN"
+MISSION_MODE = "SCAN"       # "WAYPOINT" veya "SCAN"
 
 # ── Bağlantı ─────────────────────────────────────────────────────────────────
 VTOL_CONNECTION = "udp:127.0.0.1:14550"
@@ -58,7 +58,7 @@ DRONE_IP        = "127.0.0.1"
 DRONE_PORT      = 6000
 
 # ── Uçuş ─────────────────────────────────────────────────────────────────────
-TAKEOFF_ALT  = 30.0   # metre
+TAKEOFF_ALT  = 50.0   # metre
 CRUISE_SPEED = 5.0    # m/s
 
 # ── WAYPOINT modu ─────────────────────────────────────────────────────────────
@@ -68,11 +68,17 @@ WP_ARRIVAL_DIST = 10.0   # metre
 WP_HOVER_TIME   = 3.0    # saniye
 
 # ── SCAN modu ─────────────────────────────────────────────────────────────────
-SCAN_ALT        = 30.0   # metre – tarama irtifası
+SCAN_ALT        = 50.0   # metre – tarama irtifası
 SCAN_SPEED      = 5.0    # m/s
 SCAN_RADIUS_M   = 80.0   # metre – oval yarı eksen
 SCAN_POINTS     = 16     # oval üzerindeki WP sayısı
-SCAN_REPEAT     = 0      # 0 = tespit edilene kadar tekrar
+SCAN_LAPS       = 2      # kaç tur (0 = sonsuz)
+DETECT_COOLDOWN = 15.0   # saniye – aynı bölgede tekrar tespit saymaması için
+
+# ── İHA Servo (drone serbest bırakma) ────────────────────────────────────────
+IHA_SERVO_CH    = 9      # servo kanalı
+IHA_SERVO_OPEN  = 2000   # µs – drone serbest
+IHA_SERVO_CLOSE = 1000   # µs – drone kilitli
 
 # ── YOLOv8 ───────────────────────────────────────────────────────────────────
 YOLO_MODEL      = "yolov8n.pt"
@@ -277,11 +283,11 @@ class VTOLController:
         self.camera         = GazeboCamera()
         self.detector       = PersonDetector()
 
-        self._confirm_count = 0
-        self._target_found  = False
-        self._target_lock   = threading.Lock()
-        self._target_lat    = None
-        self._target_lon    = None
+        self._confirm_count  = 0
+        self._detect_queue   = []          # onaylanan tespitler buraya girer
+        self._detect_lock    = threading.Lock()
+        self._last_detect_ts = 0.0         # cooldown kontrolü için
+        self._releases_done  = 0           # kaç kez drone bırakıldı
 
     # ── Bağlantı ─────────────────────────────────────────────────────────────
 
@@ -533,6 +539,24 @@ class VTOLController:
         self._set_mode("RTL")
         self.mission_active = False
 
+    # ── İHA Servo: drone serbest bırak ───────────────────────────────────────
+
+    def _release_drone(self):
+        self._releases_done += 1
+        n = self._releases_done
+        print(f"[İHA] Drone #{n} serbest bırakılıyor – "
+              f"kanal {IHA_SERVO_CH}, PWM {IHA_SERVO_OPEN} µs")
+        self.vehicle.mav.command_long_send(
+            self.vehicle.target_system, self.vehicle.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0, IHA_SERVO_CH, IHA_SERVO_OPEN, 0, 0, 0, 0, 0)
+        time.sleep(3.0)  # drone serbest düşsün, kendi stabilize olsun
+        self.vehicle.mav.command_long_send(
+            self.vehicle.target_system, self.vehicle.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0, IHA_SERVO_CH, IHA_SERVO_CLOSE, 0, 0, 0, 0, 0)
+        print(f"[İHA] Drone #{n} serbest bırakıldı – servo kapatıldı.")
+
     # ── Drone'a koordinat gönder ──────────────────────────────────────────────
 
     def _send_to_drone(self, lat, lon, alt=25.0):
@@ -561,7 +585,7 @@ class VTOLController:
         prev_count = 0
         warn_ts    = time.time()
 
-        while self.mission_active and not self._target_found:
+        while self.mission_active:
             if self.camera.frame_count == prev_count:
                 if time.time() - warn_ts >= 10:
                     print(f"[Görüntü] Frame bekleniyor "
@@ -588,20 +612,28 @@ class VTOLController:
                   end="\r")
 
             if self._confirm_count >= CONFIRM_FRAMES:
+                now = time.time()
+                # Cooldown: aynı bölgede kısa sürede tekrar onaylama
+                if now - self._last_detect_ts < DETECT_COOLDOWN:
+                    self._confirm_count = 0
+                    continue
+
                 lat, lon, alt, yaw = self._get_position()
                 if lat is None:
                     self._confirm_count = 0
                     continue
+
                 h, w = frame.shape[:2]
                 tgt_lat, tgt_lon = pixel_to_gps(
                     best["cx"], best["cy"], w, h, lat, lon, alt, yaw)
+
                 print(f"\n[Görüntü] {CONFIRM_FRAMES} frame onaylandı! "
                       f"Hedef=({tgt_lat:.6f},{tgt_lon:.6f})")
-                with self._target_lock:
-                    self._target_lat   = tgt_lat
-                    self._target_lon   = tgt_lon
-                    self._target_found = True
-                self._confirm_count = 0
+
+                with self._detect_lock:
+                    self._detect_queue.append((tgt_lat, tgt_lon))
+                self._last_detect_ts = now
+                self._confirm_count  = 0   # sıfırla, tarama devam edecek
 
             time.sleep(0.05)
         print("[Görüntü] Döngü sonlandı.")
@@ -609,7 +641,13 @@ class VTOLController:
     # ── SCAN görev döngüsü ────────────────────────────────────────────────────
 
     def _scan_loop(self):
-        """Oval tarama: her turda yeniden mission yükle, vision thread paralel."""
+        """
+        Tam görev akışı:
+        Kalkış sonrası → oval tarama (SCAN_LAPS tur)
+        Her WP'ye giderken tespit kuyruğu kontrol edilir.
+        Tespit varsa: hover → servo (drone bırak) → koordinat gönder → taramaya devam.
+        Tüm turlar bitti → RTL.
+        """
         home_lat, home_lon, home_alt, _ = self._get_position()
         if home_lat is None:
             print("[İHA] GPS alınamadı!")
@@ -618,25 +656,61 @@ class VTOLController:
         waypoints = generate_oval(
             home_lat, home_lon, SCAN_RADIUS_M, SCAN_POINTS, SCAN_ALT)
 
-        print(f"[İHA] Oval tarama – {SCAN_POINTS} WP, yarıçap={SCAN_RADIUS_M}m")
+        lap_str = str(SCAN_LAPS) if SCAN_LAPS > 0 else "∞"
+        print(f"[İHA] Oval tarama başlıyor – "
+              f"{SCAN_POINTS} WP, yarıçap={SCAN_RADIUS_M}m, {lap_str} tur")
 
         tur = 0
-        while self.mission_active and not self._target_found:
+        while self.mission_active:
             tur += 1
-            if SCAN_REPEAT > 0 and tur > SCAN_REPEAT:
-                print(f"[İHA] {SCAN_REPEAT} tur tamamlandı – tespit yok.")
+            if SCAN_LAPS > 0 and tur > SCAN_LAPS:
+                print(f"[İHA] {SCAN_LAPS} tur tamamlandı – RTL.")
                 break
 
-            print(f"\n[İHA] ── TUR {tur} ──")
+            print(f"\n[İHA] ── TUR {tur}/{lap_str} ──")
             self._set_nav_mode()
             self._set_speed(SCAN_SPEED)
 
             for wp_lat, wp_lon, wp_alt in waypoints:
-                if not self.mission_active or self._target_found:
+                if not self.mission_active:
                     break
+
                 self._goto(wp_lat, wp_lon, wp_alt)
 
-                while self.mission_active and not self._target_found:
+                # WP'ye ulaşana kadar hem mesafe hem tespit kuyruğu kontrol
+                while self.mission_active:
+                    # Tespit var mı?
+                    detection = None
+                    with self._detect_lock:
+                        if self._detect_queue:
+                            detection = self._detect_queue.pop(0)
+
+                    if detection:
+                        tgt_lat, tgt_lon = detection
+                        print(f"\n[İHA] ★ TESPİT İŞLENİYOR "
+                              f"→ ({tgt_lat:.6f}, {tgt_lon:.6f})")
+
+                        # Hover yap
+                        self._set_nav_mode()
+                        self._hover()
+                        time.sleep(2)
+
+                        # Servo: drone'u serbest bırak
+                        self._release_drone()
+
+                        # Koordinatı drone'a / yer istasyonuna ilet
+                        self._send_to_drone(tgt_lat, tgt_lon)
+
+                        # Drone stabilize olsun, sonra taramaya devam
+                        print("[İHA] Drone stabilize bekleniyor (5s)...")
+                        time.sleep(5)
+
+                        # Mevcut WP'ye taramayı sürdür
+                        self._set_nav_mode()
+                        self._set_speed(SCAN_SPEED)
+                        self._goto(wp_lat, wp_lon, wp_alt)
+
+                    # WP mesafe kontrolü
                     lat, lon, _, _ = self._get_position()
                     if lat is None:
                         time.sleep(0.3)
@@ -645,16 +719,6 @@ class VTOLController:
                         break
                     self._goto(wp_lat, wp_lon, wp_alt)  # ArduPlane: periyodik yenile
                     time.sleep(1.0)
-
-        if self._target_found:
-            print("\n[İHA] Hedef onaylandı – hover yapılıyor...")
-            self._set_nav_mode()
-            self._hover()
-            time.sleep(3)
-            with self._target_lock:
-                tgt_lat, tgt_lon = self._target_lat, self._target_lon
-            self._send_to_drone(tgt_lat, tgt_lon)
-            time.sleep(5)
 
         self._rtl()
 
